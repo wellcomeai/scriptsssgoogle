@@ -4,13 +4,16 @@
 
 const CONFIG = {
   openai: {
-    apiKey: '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',
+    apiKey: 'sk-HM7Csrh-12lBUWVopxS1r4nwbUursNdgYO48R-pGk6T3BlbkFJDjXWVqs7o3eVrq6JCxV2KW0LsRe1H9gjXXXXXX',
     apiUrl: 'https://api.openai.com/v1/chat/completions',
     model: 'gpt-4o-mini'
   },
   telegram: {
-    botToken: '8431768082:AAH_Uxug5b0Q4TdrUQMrMSMjChPzIwFy6Is',
-    chatId: '418838097'
+    botToken: '8372070218:AAEZrSDVJ4kqUm5QYIRtPp8b7qTGB7Mt_7Y',
+    chatId: '-4109810158'
+  },
+  email: {
+    recipient: 'kihcgnca165v24hr31av@task.yougile.com'
   },
   marker: '🤖 Обработано от ИИ'
 };
@@ -118,6 +121,11 @@ function обработатьОдинДиалог(sheet, row, col, phone, dialog
     отправитьВTelegram(phone, analysis, sheetType);
     
     Logger.log('Уведомление отправлено в Telegram');
+    
+    // Отправляем на Email
+    отправитьНаEmail(phone, analysis, sheetType);
+    
+    Logger.log('Уведомление отправлено на Email');
     
     return true;
     
@@ -460,6 +468,61 @@ function отправитьВTelegram(phone, analysis, sheetType) {
 }
 
 // ============================================
+// 📧 ОТПРАВКА УВЕДОМЛЕНИЯ НА EMAIL
+// ============================================
+
+function отправитьНаEmail(phone, analysis, sheetType) {
+  try {
+    // ✅ ПРОВЕРКА: если анализ пустой - не отправляем
+    if (!analysis) {
+      Logger.log('Email: Пропускаем отправку - нет данных анализа');
+      return;
+    }
+    
+    const now = new Date();
+    const dateStr = Utilities.formatDate(now, Session.getScriptTimeZone(), 'dd.MM.yyyy HH:mm');
+    
+    const callTypeText = sheetType === 'Входящие' ? 'Входящий' : 'Исходящий';
+    
+    // ✅ Используем значения по умолчанию если поля пустые
+    const clientName = analysis.name || 'Не представился';
+    const clientCity = analysis.city || 'Не указан';
+    const clientInterest = analysis.interest || 'Не определен';
+    const clientStatus = analysis.status || 'Новый лид';
+    const clientSummary = analysis.summary || 'Информация отсутствует';
+    
+    // Тема письма с переменной
+    const subject = `Заявка от ${clientName} из формы CRM Voice AI`;
+    
+    // Тело письма с переменными
+    let body = `Тема заявки: Новая заявка (${callTypeText})\n\n`;
+    body += `Телефон: ${phone}\n`;
+    body += `ФИО: ${clientName}\n`;
+    body += `Город: ${clientCity}\n`;
+    body += `Интерес: ${clientInterest}\n`;
+    body += `Статус: ${clientStatus}\n\n`;
+    body += `Резюме:\n${clientSummary}\n\n`;
+    body += `Тип звонка: ${callTypeText}\n`;
+    body += `Дата: ${dateStr}\n\n`;
+    body += `---\n`;
+    body += `Источник: chatforyou.ru`;
+    
+    // Отправляем письмо
+    MailApp.sendEmail({
+      to: CONFIG.email.recipient,
+      subject: subject,
+      body: body
+    });
+    
+    Logger.log('Email: Письмо успешно отправлено на ' + CONFIG.email.recipient);
+    
+  } catch (error) {
+    Logger.log('ОШИБКА при отправке на Email: ' + error.toString());
+    Logger.log('Stack: ' + error.stack);
+  }
+}
+
+// ============================================
 // ⏰ УПРАВЛЕНИЕ ТРИГГЕРАМИ ДЛЯ АНАЛИЗА
 // ============================================
 
@@ -472,12 +535,11 @@ function установитьАвтоанализ() {
       .everyMinutes(1)
       .create();
     
-    SpreadsheetApp.getUi().alert('✅ Автоанализ включен!\n\nСкрипт будет проверять новые диалоги каждую минуту.');
-    
-    onOpen();
+    Logger.log('Автоанализ включен (каждую минуту)');
+    onOpen(); // Обновляем меню
     
   } catch (error) {
-    SpreadsheetApp.getUi().alert('❌ Ошибка: ' + error.toString());
+    Logger.log('Ошибка установки автоанализа: ' + error.toString());
   }
 }
 
@@ -494,33 +556,37 @@ function удалитьАвтоанализ() {
     }
     
     if (deletedCount > 0) {
-      SpreadsheetApp.getUi().alert('✅ Автоанализ выключен');
-    } else {
-      SpreadsheetApp.getUi().alert('ℹ️ Автоанализ не был включен');
+      Logger.log('Автоанализ выключен');
     }
     
-    onOpen();
+    onOpen(); // Обновляем меню
     
   } catch (error) {
-    SpreadsheetApp.getUi().alert('❌ Ошибка: ' + error.toString());
+    Logger.log('Ошибка удаления автоанализа: ' + error.toString());
   }
 }
 
 function переключитьАвтоанализ() {
-  const triggers = ScriptApp.getProjectTriggers();
-  let isActive = false;
-  
-  for (let trigger of triggers) {
-    if (trigger.getHandlerFunction() === 'анализироватьДиалоги') {
-      isActive = true;
-      break;
+  try {
+    const triggers = ScriptApp.getProjectTriggers();
+    let isActive = false;
+    
+    for (let trigger of triggers) {
+      if (trigger.getHandlerFunction() === 'анализироватьДиалоги') {
+        isActive = true;
+        break;
+      }
     }
-  }
-  
-  if (isActive) {
-    удалитьАвтоанализ();
-  } else {
-    установитьАвтоанализ();
+    
+    if (isActive) {
+      удалитьАвтоанализ();
+      SpreadsheetApp.getUi().alert('✅ Автоанализ выключен');
+    } else {
+      установитьАвтоанализ();
+      SpreadsheetApp.getUi().alert('✅ Автоанализ включен!\n\nСкрипт будет проверять новые диалоги каждую минуту.');
+    }
+  } catch (error) {
+    SpreadsheetApp.getUi().alert('❌ Ошибка: ' + error.toString());
   }
 }
 
@@ -555,7 +621,7 @@ function тестТелеграм() {
     Logger.log('Response: ' + response.getContentText());
     
     if (responseCode === 200) {
-      SpreadsheetApp.getUi().alert('✅ Telegram работает!\n\nПроверьте сообщение в боте.');
+      SpreadsheetApp.getUi().alert('✅ Telegram работает!\n\nПроверьте сообщение в групповом чате.');
     } else {
       SpreadsheetApp.getUi().alert('❌ Ошибка Telegram:\n\n' + response.getContentText());
     }
@@ -563,5 +629,65 @@ function тестТелеграм() {
   } catch (error) {
     Logger.log('ОШИБКА в тесте: ' + error.toString());
     SpreadsheetApp.getUi().alert('❌ Ошибка: ' + error.toString());
+  }
+}
+
+// ============================================
+// 🧪 ТЕСТ EMAIL
+// ============================================
+
+function тестEmail() {
+  try {
+    Logger.log('Начало теста Email...');
+    Logger.log('Recipient: ' + CONFIG.email.recipient);
+    
+    const testAnalysis = {
+      city: 'Москва',
+      name: 'Тестовый Клиент',
+      interest: 'Высокий',
+      status: 'Новый лид',
+      summary: 'Это тестовое письмо для проверки интеграции с Yougile.'
+    };
+    
+    отправитьНаEmail('79001234567', testAnalysis, 'Входящие');
+    
+    SpreadsheetApp.getUi().alert('✅ Тестовое письмо отправлено!\n\nПроверьте ' + CONFIG.email.recipient);
+    
+  } catch (error) {
+    Logger.log('ОШИБКА в тесте Email: ' + error.toString());
+    SpreadsheetApp.getUi().alert('❌ Ошибка Email:\n\n' + error.toString());
+  }
+}
+
+// ============================================
+// 🎨 ОБНОВЛЕНИЕ ЦВЕТА РАМКИ ПО СТАТУСУ
+// ============================================
+
+function updateCellBorderByStatus(sheet, row, col, status) {
+  try {
+    const cell = sheet.getRange(row, col);
+    let color;
+    
+    switch (status) {
+      case 'Новый лид':
+        color = '#4285f4'; // Синий
+        break;
+      case 'Требует уточнений':
+        color = '#fbbc04'; // Желтый
+        break;
+      case 'Готов к сделке':
+        color = '#34a853'; // Зеленый
+        break;
+      case 'Отказ':
+        color = '#ea4335'; // Красный
+        break;
+      default:
+        color = '#9e9e9e'; // Серый
+    }
+    
+    cell.setBorder(true, true, true, true, null, null, color, SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    
+  } catch (error) {
+    Logger.log('ОШИБКА при обновлении цвета рамки: ' + error.toString());
   }
 }
