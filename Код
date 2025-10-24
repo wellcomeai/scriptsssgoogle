@@ -1,1104 +1,432 @@
 /******************************************************
- * main.gs (с улучшенной последовательной обработкой API + парсинг данных клиента)
+ * TelegramLeadNotifier.gs
+ * Автоматическая отправка анализов от ИИ в Telegram и Email
+ * ВАЖНО: Функция onOpen() удалена для избежания конфликтов с main.gs
+ * Меню добавляется через main.gs
  ******************************************************/
 
 /**
- * Парсит данные клиента из строки формата:
- * "from_user_id:418838097 message_id:49 Валерий Шишкин (@well_sh) ru"
- * @param {string} rawData - сырые данные из столбца
- * @return {Object} объект с chatID и username
+ * КОНСТАНТЫ ДЛЯ TELEGRAM BOT
  */
-function parseUserData(rawData) {
-  if (!rawData) {
-    return { chatID: null, username: null };
+var TELEGRAM_BOT_TOKEN = "8372070218:AAEZrSDVJ4kqUm5QYIRtPp8b7qTGB7Mt_7Y";
+var TELEGRAM_CHAT_ID = "-4109810158";
+
+/**
+ * КОНСТАНТЫ ДЛЯ EMAIL
+ */
+var EMAIL_ADDRESS = "kihcgnca165v24hr31av@task.yougile.com";
+var EMAIL_SUBJECT = "Текстовый ИИ новая заявка";
+
+/**
+ * КОНСТАНТЫ ДЛЯ ОБРАБОТКИ СООБЩЕНИЙ
+ */
+var TELEGRAM_MAX_LENGTH = 4096;
+var TELEGRAM_SAFE_LENGTH = 4000; // Оставляем запас для текста об обрезке
+
+/**
+ * Отправляет сообщение в Telegram через Bot API
+ * Автоматически обрезает слишком длинные сообщения
+ * @param {string} message - текст сообщения для отправки
+ * @param {string} cellAddress - адрес ячейки (например "B15") для указания местоположения полного текста
+ * @return {boolean} true если успешно, false если ошибка
+ */
+function sendToTelegram(message, cellAddress) {
+  // КРИТИЧЕСКАЯ ПРОВЕРКА: сообщение не должно быть пустым
+  if (!message || message.toString().trim() === "") {
+    Logger.log("❌ ОШИБКА: Попытка отправить пустое сообщение в Telegram!");
+    return false;
   }
   
-  var dataStr = rawData.toString().trim();
-  var userId = dataStr.match(/from_user_id:(\d+)/);
-  var username = dataStr.match(/@(\w+)/);
+  var originalMessage = message.toString().trim();
+  var messageToSend = originalMessage;
+  var messageLength = originalMessage.length;
   
-  return {
-    chatID: userId ? userId[1] : null,
-    username: username ? username[1] : null
-  };
-}
-
-/**
- * Формирует итоговый chatID с никнеймом в формате "418838097 (@well_sh)"
- * @param {string} chatID - ID пользователя
- * @param {string} username - никнейм пользователя (без @)
- * @return {string} форматированный chatID
- */
-function formatChatIDWithUsername(chatID, username) {
-  if (!chatID) return null;
-  if (username) {
-    return chatID + " (@" + username + ")";
-  }
-  return chatID;
-}
-
-/**
- * Обновляет историю диалогов из "Лист1" и распределяет данные по датам в листе "Диалоги".
- */
-function updateDialogHistory() {
-  var startTime = new Date();
-  writeLog("Начато обновление диалогов");
-
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sourceSheet = ss.getSheetByName("Лист1");
-  if (!sourceSheet) {
-    writeLog("Лист1 не найден!", "ERROR");
-    return;
-  }
-
-  var data = sourceSheet.getDataRange().getValues();
-  if (data.length < 2) {
-    writeLog("Нет данных для обработки в Лист1.", "WARNING");
-    return;
-  }
-
-  var headers = data[0];
-  var chatIDIndex = headers.indexOf("Уникальный номер канала общения");
-  var userDataIndex = headers.indexOf("Уникальный номер клиента");
-  var clientMsgIndex = headers.indexOf("Фраза клиента");
-  var botMsgIndex = headers.indexOf("Фраза бота");
-  var timestampIndex = headers.indexOf("Дата и время");
-  // Колонка P (индекс 15) – отметка "Обработано"
-  var processedIndex = 15;
-
-  if (chatIDIndex === -1 || clientMsgIndex === -1 || botMsgIndex === -1 || timestampIndex === -1) {
-    writeLog("Не найдены необходимые колонки в Лист1.", "ERROR");
-    return;
+  Logger.log("📤 Отправка сообщения в Telegram, длина: " + messageLength + " символов");
+  
+  // Проверяем длину сообщения и обрезаем если нужно
+  if (messageLength > TELEGRAM_MAX_LENGTH) {
+    Logger.log("⚠️ Сообщение слишком длинное (" + messageLength + " символов), обрезаем до " + TELEGRAM_SAFE_LENGTH);
+    
+    // Обрезаем до безопасной длины
+    messageToSend = originalMessage.substring(0, TELEGRAM_SAFE_LENGTH);
+    
+    // Добавляем информацию об обрезке и местонахождении полного текста
+    var truncateInfo = "\n\n⚠️ Диалог обрезан (слишком длинный)\n📍 Полный текст в ячейке: " + cellAddress;
+    messageToSend += truncateInfo;
+    
+    Logger.log("✂️ Сообщение обрезано, новая длина: " + messageToSend.length + " символов");
   }
   
-  if (userDataIndex === -1) {
-    writeLog("Не найден столбец 'Уникальный номер клиента'. Будет использоваться только 'Уникальный номер канала общения'.", "WARNING");
-  }
-
-  // Сессии, сгруппированные по chatID (с никнеймом)
-  var sessions = {};
-  for (var i = 1; i < data.length; i++) {
-    var row = data[i];
-    var rawChatID = row[chatIDIndex];
-    
-    // Пытаемся получить chatID и никнейм из столбца "Уникальный номер клиента"
-    var finalChatID = null;
-    if (userDataIndex !== -1 && row[userDataIndex]) {
-      var userData = parseUserData(row[userDataIndex]);
-      if (userData.chatID) {
-        finalChatID = formatChatIDWithUsername(userData.chatID, userData.username);
-        writeLog("Распарсены данные: chatID=" + userData.chatID + ", username=" + userData.username, "DEBUG");
-      }
-    }
-    
-    // Если не удалось получить из нового столбца, используем старый chatID
-    if (!finalChatID && rawChatID) {
-      finalChatID = cleanChatID(rawChatID);
-    }
-    
-    if (!finalChatID) continue;
-
-    // Пропускаем строки, где уже стоит отметка в колонке P
-    var processed = row[processedIndex];
-    if (processed && processed.toString().trim() !== "") continue;
-
-    // Дата (в формате dd.MM.yyyy)
-    var ts = new Date(row[timestampIndex]);
-    var dateStr = Utilities.formatDate(ts, ss.getSpreadsheetTimeZone(), "dd.MM.yyyy");
-
-    if (!sessions[finalChatID]) {
-      sessions[finalChatID] = { dates: {}, rows: [] };
-    }
-    if (!sessions[finalChatID].dates[dateStr]) {
-      sessions[finalChatID].dates[dateStr] = [];
-    }
-
-    sessions[finalChatID].dates[dateStr].push({
-      timestamp: row[timestampIndex],
-      client: row[clientMsgIndex] || "",
-      bot: row[botMsgIndex] || ""
-    });
-
-    // Запоминаем номер строки для отметки
-    sessions[finalChatID].rows.push(i + 1);
-  }
-
-  var sessionsProcessed = 0;
-  for (var finalChatID in sessions) {
-    var session = sessions[finalChatID];
-    var newData = {};
-
-    for (var dateStr in session.dates) {
-      var messages = session.dates[dateStr];
-      messages.sort(function(a, b) {
-        return new Date(a.timestamp) - new Date(b.timestamp);
-      });
-      var dialog = "";
-      for (var j = 0; j < messages.length; j++) {
-        dialog += "[" + messages[j].timestamp + "] Клиент: " + messages[j].client + "\nАссистент: " + messages[j].bot + "\n\n";
-      }
-      newData[dateStr] = dialog.trim();
-    }
-    updateDialogSheetForChatID(finalChatID, newData);
-
-    // Помечаем строки как "Обработано"
-    for (var r = 0; r < session.rows.length; r++) {
-      sourceSheet.getRange(session.rows[r], processedIndex + 1).setValue("Обработано");
-    }
-    sessionsProcessed++;
-  }
-
-  // Обновляем дату последнего обновления
-  var dialogSheet = getDialogSheet();
-  var now = new Date();
-  dialogSheet.getRange("D1").setValue(
-    "Последнее обновление: " + Utilities.formatDate(now, ss.getSpreadsheetTimeZone(), "dd.MM.yyyy HH:mm")
-  );
-
-  formatDialogSheet();
-  var endTime = new Date();
-  var duration = (endTime - startTime) / 1000;
-  writeLog("Обновление диалогов завершено. Сессий: " + sessionsProcessed + ". Время: " + duration + " сек.");
-
-  // Если API активен — запускаем обработку
-  if (isApiRunning()) {
-    writeLog("API активен, запускаем processApiMessagesSequential...");
-    processApiMessagesSequential(true);
-  }
-}
-
-/**
- * Обновляет/добавляет данные для chatID в листе "Диалоги".
- * Добавляет маркер "[Собран ...]" в начало если его нет.
- * ПРАВИЛЬНО ДОБАВЛЯЕТ новые данные к существующим для одного chatID.
- * Теперь работает с chatID в формате "418838097 (@well_sh)"
- */
-function updateDialogSheetForChatID(finalChatID, newData) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var dialogSheet = getDialogSheet();
-
-  if (dialogSheet.getLastRow() < 1) {
-    dialogSheet.getRange("A1").setValue("ChatID");
-  }
-
-  var dates = Object.keys(newData);
-  dates.sort();
-
-  var lastRow = dialogSheet.getLastRow();
-  var chatIDValues = [];
-  if (lastRow >= 2) {
-    chatIDValues = dialogSheet.getRange(2, 1, lastRow - 1, 1).getValues();
-  }
-
-  // Ищем строку с нужным chatID
-  var rowIndex = 0;
-  for (var i = 0; i < chatIDValues.length; i++) {
-    if (chatIDValues[i][0] == finalChatID) {
-      rowIndex = i + 2;
-      break;
-    }
-  }
-
-  // Если chatID не найден, создаем новую строку
-  if (rowIndex === 0) {
-    rowIndex = dialogSheet.getLastRow() + 1;
-    dialogSheet.getRange(rowIndex, 1).setValue(finalChatID);
-    writeLog("Создана новая строка для ChatID: " + finalChatID, "INFO");
-  } else {
-    writeLog("Найдена существующая строка для ChatID: " + finalChatID + " (строка " + rowIndex + ")", "INFO");
-  }
-
-  var now = new Date();
-  var collectTimeStr = Utilities.formatDate(now, ss.getSpreadsheetTimeZone(), "dd.MM.yyyy HH:mm:ss");
-  var collectMarker = "[Собран " + collectTimeStr + "]\n\n";
-
-  // Обрабатываем каждую дату из новых данных
-  for (var i = 0; i < dates.length; i++) {
-    var dateStr = dates[i];
-    var colIndex = i + 2; 
-    var cell = dialogSheet.getRange(rowIndex, colIndex);
-    var currentContent = cell.getValue();
-    
-    // Проверяем, есть ли уже содержимое в ячейке
-    if (currentContent && currentContent.toString().trim() !== "") {
-      writeLog("Добавляем данные к существующей ячейке для ChatID " + finalChatID + ", дата " + dateStr, "INFO");
-      
-      // Проверяем, есть ли в текущем контенте маркер "[Обработано ИИ]"
-      var isProcessed = currentContent.toString().indexOf("[Обработано ИИ]") !== -1;
-      
-      if (isProcessed) {
-        // Если ячейка уже обработана ИИ, добавляем новые данные после обработанного контента
-        writeLog("Ячейка уже обработана ИИ, добавляем после существующего контента", "INFO");
-        
-        // Ищем, где заканчивается обработанный ИИ контент
-        var processedContent = currentContent.toString();
-        var lastContainerData = processedContent + "\n\n" + collectMarker + newData[dateStr];
-        cell.setValue(lastContainerData);
-      } else {
-        // Ячейка не обработана ИИ, просто добавляем новые данные
-        
-        // Проверяем, есть ли маркер [Собран]
-        if (currentContent.toString().indexOf("[Собран ") === -1) {
-          // Если нет маркера, добавляем его
-          cell.setValue(collectMarker + currentContent + "\n\n" + newData[dateStr]);
-        } else {
-          // Маркер уже есть, добавляем только новые данные
-          cell.setValue(currentContent + "\n\n" + newData[dateStr]);
-        }
-      }
-    } else {
-      // Ячейка была пустой, добавляем новые данные с маркером
-      writeLog("Создаем новую ячейку для ChatID " + finalChatID + ", дата " + dateStr, "INFO");
-      cell.setValue(collectMarker + newData[dateStr]);
-    }
-  }
-}
-
-/**
- * Возвращает или создаёт лист "Диалоги".
- */
-function getDialogSheet() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var dialogSheet = ss.getSheetByName("Диалоги");
-  if (!dialogSheet) {
-    dialogSheet = ss.insertSheet("Диалоги");
-    dialogSheet.getRange("A1").setValue("ChatID");
-    dialogSheet.getRange("B1").setValue("ID бота");
-    dialogSheet.getRange("C1").setValue("API токен");
-    dialogSheet.getRange("D1").setValue("Последнее обновление: ");
-    dialogSheet.getRange("E1").setValue("API обработчик: Остановлен");
-    dialogSheet.getRange("E1").setBackground("#ffe6e6").setFontWeight("bold");
-
-    PropertiesService.getScriptProperties().setProperty('API_RUNNING', 'false');
-    writeLog("Создан новый лист 'Диалоги'");
-  }
-  return dialogSheet;
-}
-
-/**
- * Очищает chatID, оставляя число между "tb" и "_".
- */
-function cleanChatID(rawChatID) {
-  var cleaned = rawChatID;
-  if (typeof cleaned === "string" && cleaned.indexOf("tb") === 0) {
-    var underscoreIndex = cleaned.indexOf("_");
-    if (underscoreIndex !== -1) {
-      cleaned = cleaned.substring(2, underscoreIndex);
-    }
-  }
-  return cleaned;
-}
-
-/**
- * Применяет форматирование к листу "Диалоги".
- */
-function formatDialogSheet() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName("Диалоги");
-  if (!sheet) return;
-
-  var dataRange = sheet.getDataRange();
-  dataRange.setWrap(true);
-  dataRange.setBorder(true, true, true, true, true, true);
-
-  var numCols = dataRange.getNumColumns();
-  var numRows = dataRange.getNumRows();
-  var allRange = sheet.getRange(1, 1, numRows, numCols);
-  allRange.setHorizontalAlignment("center");
-
-  var chatIDRange = sheet.getRange(1, 1, numRows, 1);
-  chatIDRange.setHorizontalAlignment("left");
-  chatIDRange.setFontWeight("bold");
-  chatIDRange.setBackground("#f0f0f0");
-
-  if (numRows >= 1 && numCols >= 5) {
-    var headerRow = sheet.getRange(1, 1, 1, 5);
-    headerRow.setFontWeight("bold").setBackground("#e6f2ff");
-  }
-
-  sheet.setColumnWidth(1, 150);
-  sheet.setColumnWidth(2, 200);
-  sheet.setColumnWidth(3, 300);
-  sheet.setColumnWidth(4, 250);
-  sheet.setColumnWidth(5, 200);
-
-  for (var i = 7; i <= numCols; i++) {
-    sheet.autoResizeColumn(i);
-  }
-  allRange.setFontFamily("Arial").setFontSize(10);
-
-  writeLog("Применено форматирование к листу 'Диалоги'");
-}
-
-/**
- * Возвращает или создаёт лист "Логи скрипта".
- */
-function getLogSheet() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var logSheet = ss.getSheetByName("Логи скрипта");
-  if (!logSheet) {
-    logSheet = ss.insertSheet("Логи скрипта");
-    logSheet.getRange("A1:D1").setValues([["Время", "Уровень", "Сообщение", "Дополнительно"]]);
-    logSheet.getRange("A1:D1").setBackground("#4285F4").setFontColor("white").setFontWeight("bold");
-    logSheet.setFrozenRows(1);
-
-    logSheet.setColumnWidth(1, 180);
-    logSheet.setColumnWidth(2, 90);
-    logSheet.setColumnWidth(3, 400);
-    logSheet.setColumnWidth(4, 200);
-
-    Logger.log("Создан лист 'Логи скрипта'");
-  }
-  return logSheet;
-}
-
-/**
- * Записывает сообщение в лист логов.
- */
-function writeLog(message, level, extra) {
-  if (!level) level = "INFO";
-  Logger.log("[" + level + "] " + message);
-
-  try {
-    var logSheet = getLogSheet();
-    var now = new Date();
-    var timestamp = Utilities.formatDate(
-      now, 
-      SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), 
-      "dd.MM.yyyy HH:mm:ss"
-    );
-
-    logSheet.insertRowAfter(1);
-    var logRow = [timestamp, level, message, extra || ""];
-    logSheet.getRange(2, 1, 1, 4).setValues([logRow]);
-
-    var levelCell = logSheet.getRange(2, 2);
-    switch(level.toUpperCase()) {
-      case "ERROR":
-        levelCell.setBackground("#f4c7c3");
-        break;
-      case "WARNING":
-        levelCell.setBackground("#fce8b2");
-        break;
-      case "DEBUG":
-        levelCell.setBackground("#d9d2e9");
-        break;
-      default:
-        levelCell.setBackground("#d9ead3");
-    }
-
-    var lastRow = logSheet.getLastRow();
-    if (lastRow > 1000) {
-      logSheet.deleteRows(1001, lastRow - 1000);
-    }
-  } catch (e) {
-    Logger.log("Ошибка при записи в лог: " + e);
-  }
-}
-
-/**
- * Очищает лист "Логи скрипта", кроме шапки.
- */
-function clearLogs() {
-  try {
-    var logSheet = getLogSheet();
-    var lastRow = logSheet.getLastRow();
-    if (lastRow > 1) {
-      logSheet.deleteRows(2, lastRow - 1);
-    }
-    writeLog("Логи успешно очищены");
-    SpreadsheetApp.getUi().alert("Логи", "Логи успешно очищены", SpreadsheetApp.getUi().ButtonSet.OK);
-  } catch (e) {
-    Logger.log("Ошибка при очистке логов: " + e);
-    SpreadsheetApp.getUi().alert("Ошибка", "Не удалось очистить логи: " + e, SpreadsheetApp.getUi().ButtonSet.OK);
-  }
-}
-
-/**
- * Инициализирует поля API (B1=botId, C1=token).
- */
-function initializeApiFields() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var dialogSheet = ss.getSheetByName("Диалоги");
-  if (!dialogSheet) {
-    dialogSheet = getDialogSheet();
-  }
-
-  var b1Value = dialogSheet.getRange("B1").getValue();
-  var c1Value = dialogSheet.getRange("C1").getValue();
-  var e1Value = dialogSheet.getRange("E1").getValue();
-  if (!b1Value || b1Value === "ID бота") {
-    dialogSheet.getRange("B1").setValue("ID бота")
-      .setFontWeight("bold").setBackground("#e6f2ff");
-  }
-  if (!c1Value || c1Value === "API токен") {
-    dialogSheet.getRange("C1").setValue("API токен")
-      .setFontWeight("bold").setBackground("#e6f2ff");
-  }
-  if (!e1Value) {
-    dialogSheet.getRange("E1").setValue("API обработчик: Остановлен")
-      .setFontWeight("bold").setBackground("#ffe6e6");
-  }
-  formatDialogSheet();
-  writeLog("Инициализированы поля для API", "INFO");
-}
-
-/**
- * Запускает API-обработчик.
- */
-function startApiProcessing() {
-  var ui = SpreadsheetApp.getUi();
-  if (isApiRunning()) {
-    ui.alert('API уже запущен', 'API-обработчик уже активен.', ui.ButtonSet.OK);
-    writeLog("Попытка повторного запуска API, который уже активен", "WARNING");
-    return;
-  }
-
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var dialogSheet = ss.getSheetByName("Диалоги");
-  if (!dialogSheet) {
-    ui.alert('Ошибка', 'Лист "Диалоги" не найден!', ui.ButtonSet.OK);
-    writeLog("Не удалось запустить API: лист 'Диалоги' не найден", "ERROR");
-    return;
-  }
-
-  var botId = getBotId();
-  var apiToken = getApiToken();
-  if (!botId || !apiToken) {
-    ui.alert('Ошибка', 'Укажите ID бота (B1) и токен (C1)!', ui.ButtonSet.OK);
-    writeLog("Не удалось запустить API: нет botId или токена", "ERROR");
-    return;
-  }
-
-  PropertiesService.getScriptProperties().setProperty('API_RUNNING', 'true');
-
-  updateApiStatusDisplay();
-  createApiTrigger();
-
-  // Сразу пробуем обработать
-  processApiMessagesSequential(true);
-
-  ui.alert('API запущен', 'Обработчик активирован, последовательный режим.', ui.ButtonSet.OK);
-  writeLog("API-обработчик успешно запущен (последовательный режим)", "INFO");
-}
-
-/**
- * Останавливает API-обработчик.
- */
-function stopApiProcessing() {
-  var ui = SpreadsheetApp.getUi();
-  if (!isApiRunning()) {
-    ui.alert('API не запущен', 'Нечего останавливать.', ui.ButtonSet.OK);
-    writeLog("Попытка остановки неактивного API", "WARNING");
-    return;
-  }
-
-  PropertiesService.getScriptProperties().setProperty('API_RUNNING', 'false');
+  var url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage";
   
-  var triggers = ScriptApp.getProjectTriggers();
-  for (var i = 0; i < triggers.length; i++) {
-    var fn = triggers[i].getHandlerFunction();
-    if (fn === 'processApiMessages' || fn === 'processApiMessagesSequential' || fn === 'continueApiProcessingSequential') {
-      ScriptApp.deleteTrigger(triggers[i]);
-      writeLog("Удалён триггер " + fn, "INFO");
-    }
-  }
-
-  updateApiStatusDisplay();
-  ui.alert('API остановлен', 'Обработчик остановлен.', ui.ButtonSet.OK);
-  writeLog("API-обработчик остановлен", "INFO");
-}
-
-/**
- * Создаёт триггер для processApiMessagesSequential каждые 15 минут.
- */
-function createApiTrigger() {
-  var triggers = ScriptApp.getProjectTriggers();
-  for (var i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction() === 'processApiMessagesSequential') {
-      ScriptApp.deleteTrigger(triggers[i]);
-    }
-  }
-  ScriptApp.newTrigger("processApiMessagesSequential")
-    .timeBased()
-    .everyMinutes(15)
-    .create();
-  writeLog("Создан триггер для processApiMessagesSequential каждые 15 минут");
-}
-
-/**
- * Проверяет, запущен ли API.
- */
-function isApiRunning() {
-  var apiRunning = PropertiesService.getScriptProperties().getProperty('API_RUNNING');
-  return apiRunning === 'true';
-}
-
-/**
- * Обновляет отображение статуса API в ячейке E1.
- */
-function updateApiStatusDisplay() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var dialogSheet = ss.getSheetByName("Диалоги");
-  if (!dialogSheet) return;
-
-  var running = isApiRunning();
-  var statusCell = dialogSheet.getRange("E1");
-  if (running) {
-    statusCell.setValue("API обработчик: Запущен (последовательный)")
-      .setFontWeight("bold")
-      .setBackground("#e6ffe6");
-  } else {
-    statusCell.setValue("API обработчик: Остановлен")
-      .setFontWeight("bold")
-      .setBackground("#ffe6e6");
-  }
-  writeLog("Статус API обновлён: " + (running ? "Запущен (последовательный)" : "Остановлен"), "INFO");
-}
-
-/**
- * Получает значение ID бота (Диалоги!B1).
- */
-function getBotId() {
-  var dialogSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Диалоги");
-  if (!dialogSheet) return "";
-  return dialogSheet.getRange("B1").getValue().toString().trim();
-}
-
-/**
- * Получает значение API токена (Диалоги!C1).
- */
-function getApiToken() {
-  var dialogSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Диалоги");
-  if (!dialogSheet) return "";
-  return dialogSheet.getRange("C1").getValue().toString().trim();
-}
-
-/**
- * Отправляет сообщение через API ChatForYou и возвращает ответ.
- */
-function sendMessageAndGetResponse(token, botId, chatId, messageId, message) {
-  var url = "https://api.chatforyou.ru/api/v1.0/ask/" + token;
   var payload = {
-    bot_id: Number(botId),
-    chat_id: chatId,
-    message_id: messageId,
-    message: message
+    chat_id: TELEGRAM_CHAT_ID,
+    text: messageToSend,
+    parse_mode: "HTML"
   };
-
+  
   var options = {
     method: "post",
     contentType: "application/json",
-    headers: {
-      Authorization: "Bearer " + token
-    },
     payload: JSON.stringify(payload),
     muteHttpExceptions: true
   };
-
+  
   try {
     var response = UrlFetchApp.fetch(url, options);
-    var code = response.getResponseCode();
-    var body = response.getContentText();
-    if (code === 200) {
-      var json = JSON.parse(body);
-      var answer = json.done || json.response || null;
-      return answer;
+    var responseCode = response.getResponseCode();
+    var responseText = response.getContentText();
+    
+    if (responseCode === 200) {
+      Logger.log("✅ Сообщение успешно отправлено в Telegram");
+      return true;
     } else {
-      writeLog("API вернул код: " + code + " - " + body, "ERROR");
-      return null;
+      Logger.log("❌ Ошибка Telegram API: " + responseCode + " - " + responseText);
+      return false;
     }
-  } catch (e) {
-    writeLog("Ошибка при fetch: " + e.message, "ERROR");
-    return null;
+  } catch (error) {
+    Logger.log("❌ Исключение при отправке в Telegram: " + error.message);
+    return false;
   }
 }
 
 /**
- * Извлекает оригинальный диалог из текста с маркером [Собран]
- * @param {string} text - исходный текст с маркером
- * @return {string} - извлеченный диалог
+ * Отправляет сообщение на Email через MailApp
+ * @param {string} message - текст сообщения для отправки (полный текст без ограничений)
+ * @return {boolean} true если успешно, false если ошибка
  */
-function extractOriginalDialog(text) {
-  // Находим индекс маркера [Собран]
-  var sobranIndex = text.indexOf("[Собран ");
-  if (sobranIndex === -1) return text;
+function sendToEmail(message) {
+  // КРИТИЧЕСКАЯ ПРОВЕРКА: сообщение не должно быть пустым
+  if (!message || message.toString().trim() === "") {
+    Logger.log("❌ ОШИБКА: Попытка отправить пустое сообщение на Email!");
+    return false;
+  }
   
-  // Находим конец строки с маркером
-  var endOfMarkerLine = text.indexOf("\n\n", sobranIndex);
-  if (endOfMarkerLine === -1) return text.substring(sobranIndex + 1);
+  Logger.log("📧 Отправка сообщения на Email: " + EMAIL_ADDRESS);
   
-  // Возвращаем только диалог после маркера
-  return text.substring(endOfMarkerLine + 2);
+  try {
+    MailApp.sendEmail({
+      to: EMAIL_ADDRESS,
+      subject: EMAIL_SUBJECT,
+      body: message.toString().trim()
+    });
+    
+    Logger.log("✅ Сообщение успешно отправлено на Email");
+    return true;
+  } catch (error) {
+    Logger.log("❌ Исключение при отправке на Email: " + error.message);
+    return false;
+  }
 }
 
 /**
- * Обрабатывает ячейки последовательно с немедленным обновлением каждой.
- * Оптимизированная версия без прогресс-индикатора.
- * ДОБАВЛЕН: ChatID из колонки A добавляется в начало запроса к ИИ
- * @param {boolean} autoMode - автоматический режим работы
- * @param {number} startRow - начальная строка (если продолжаем обработку)
- * @param {number} startCol - начальный столбец (если продолжаем обработку)
+ * Основная функция сканирования и отправки лидов в Telegram и Email
+ * Проверяет все ячейки листа "Диалоги" начиная с B2
+ * Ищет ячейки с маркером "🤖 АНАЛИЗ ОТ ИИ" без отметки "ЛИД ОТПРАВЛЕН"
  */
-function processApiMessagesSequential(autoMode, startRow, startCol) {
-  writeLog("=== Начало processApiMessagesSequential === (autoMode=" + autoMode +
-           ", startRow=" + startRow + ", startCol=" + startCol + ")", "DEBUG");
-
-  // Значения по умолчанию
-  startRow = startRow || 2;
-  startCol = startCol || 2;
-
-  if (!isApiRunning()) {
-    writeLog("API не активен! Обработка ячеек не выполняется.", "INFO");
-    return;
-  }
-
+function scanAndSendLeadsToTelegram() {
+  Logger.log("=== Начало сканирования лидов для Telegram и Email ===");
+  
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var dialogSheet = ss.getSheetByName("Диалоги");
-  if (!dialogSheet) {
-    writeLog("Лист 'Диалоги' не найден. Остановка.", "ERROR");
-    return;
-  }
-
-  var botId = dialogSheet.getRange("B1").getValue();
-  var apiToken = dialogSheet.getRange("C1").getValue();
-  if (!botId || !apiToken) {
-    writeLog("Отсутствуют botId или API-токен в B1/C1", "ERROR");
-    return;
-  }
-
-  // Регулярка "[Собран DD.MM.YYYY HH:MM:SS]"
-  var sobranRegex = /\[Собран\s\d{2}\.\d{2}\.\d{4}\s\d{2}:\d{2}:\d{2}\]/;
   
-  // Получаем размеры листа
+  if (!dialogSheet) {
+    Logger.log("❌ Лист 'Диалоги' не найден!");
+    return;
+  }
+  
   var lastRow = dialogSheet.getLastRow();
   var lastCol = dialogSheet.getLastColumn();
   
-  writeLog("Размеры листа: " + lastRow + " строк, " + lastCol + " столбцов", "DEBUG");
+  Logger.log("📊 Размеры листа: " + lastRow + " строк, " + lastCol + " колонок");
   
-  // Обработка одной ячейки
-  var cellProcessed = false;
-  var foundCellToProcess = false;
+  // Счетчики для статистики
+  var leadsFound = 0;
+  var leadsSent = 0;
+  var leadsSkipped = 0;
+  var leadsError = 0;
   
-  // Цикл по строкам (1-based)
-  outerLoop:
-  for (var row = startRow; row <= lastRow; row++) {
-    // Цикл по столбцам
-    for (var col = (row === startRow ? startCol : 2); col <= lastCol; col++) {
-      var cellValue = dialogSheet.getRange(row, col).getValue();
+  // Сканируем все ячейки начиная с B2 (колонка 2, строка 2)
+  for (var row = 2; row <= lastRow; row++) {
+    for (var col = 2; col <= lastCol; col++) {
+      var cell = dialogSheet.getRange(row, col);
+      var cellValue = cell.getValue();
+      
+      // Пропускаем пустые ячейки
       if (!cellValue || cellValue.toString().trim() === "") {
         continue;
       }
-
+      
       var cellText = cellValue.toString();
-      if (!sobranRegex.test(cellText)) {
+      
+      // Проверяем наличие маркера "🤖 АНАЛИЗ ОТ ИИ"
+      if (cellText.indexOf("🤖 АНАЛИЗ ОТ ИИ") === -1) {
         continue;
       }
-      if (cellText.indexOf("[Обработано ИИ]") !== -1) {
+      
+      // Проверяем, не отправлен ли уже лид
+      if (cellText.indexOf("ЛИД ОТПРАВЛЕН") !== -1) {
+        leadsSkipped++;
         continue;
       }
-
-      // Нашли ячейку для отправки
-      foundCellToProcess = true;
-      writeLog("Найдена ячейка (" + row + "," + col + "), отправка...", "INFO");
       
-      // НОВОЕ: Получаем ChatID из колонки A (столбец 1) той же строки
-      var chatIDFromColumnA = dialogSheet.getRange(row, 1).getValue();
-      var chatIDPrefix = "";
-      if (chatIDFromColumnA && chatIDFromColumnA.toString().trim() !== "" && chatIDFromColumnA.toString().trim() !== "ChatID") {
-        chatIDPrefix = "ChatID: " + chatIDFromColumnA.toString().trim() + "\n\n";
-        writeLog("Добавлен префикс ChatID из колонки A: " + chatIDFromColumnA, "DEBUG");
-      }
+      // Найден лид для отправки!
+      leadsFound++;
       
-      var chatId = "cell_r" + row + "c" + col + "_" + new Date().getTime();
-      var messageId = "msg_" + new Date().getTime();
-      // НОВОЕ: Добавляем ChatID в начало запроса
-      var messageText = chatIDPrefix + cellText;
-
-      try {
-        // Показываем, что ячейка обрабатывается
-        dialogSheet.getRange(row, col).setBackground("#fff2cc"); // Желтый - в процессе
+      // Получаем адрес ячейки в формате A1 (например "B15")
+      var cellAddress = cell.getA1Notation();
+      Logger.log("🎯 Найден лид в ячейке " + cellAddress);
+      
+      // Отправляем в Telegram (с обрезкой если нужно)
+      var telegramSuccess = sendToTelegram(cellText, cellAddress);
+      
+      // Небольшая пауза между отправками
+      Utilities.sleep(500);
+      
+      // Отправляем на Email (полный текст)
+      var emailSuccess = sendToEmail(cellText);
+      
+      // Проверяем успешность отправки
+      if (telegramSuccess && emailSuccess) {
+        // Успешно отправлено в оба канала - добавляем маркер в начало
+        var leadSentMarker = "✅ ЛИД ОТПРАВЛЕН\n\n";
+        var newCellText = leadSentMarker + cellText;
         
-        // Отправляем запрос и получаем ответ
-        var response = sendMessageAndGetResponse(apiToken, botId, chatId, messageId, messageText);
-        if (response) {
-          var now = new Date();
-          var processedTimeStr = Utilities.formatDate(now, ss.getSpreadsheetTimeZone(), "dd.MM.yyyy HH:mm:ss");
-          
-          // Записываем только ответ и маркер обработки
-          dialogSheet.getRange(row, col).setValue(
-            "[Обработано ИИ " + processedTimeStr + "]\n" + response
-          );
-          dialogSheet.getRange(row, col).setBackground("#e6ffe6"); // Зеленый - успешно
-
-          cellProcessed = true;
-          writeLog("✅ Успешно обработана ячейка (" + row + "," + col + ")", "INFO");
-        } else {
-          writeLog("⚠️ Нет ответа от API, ячейка (" + row + "," + col + ")", "WARNING");
-          dialogSheet.getRange(row, col).setBackground("#fff2cc"); // Оставляем желтый
-        }
-      } catch (err) {
-        writeLog("❌ Ошибка в ячейке (" + row + "," + col + "): " + err, "ERROR");
-        dialogSheet.getRange(row, col).setBackground("#f4cccc"); // Красный - ошибка
+        // Обновляем ячейку
+        cell.setValue(newCellText);
+        
+        // Делаем текст маркера жирным
+        var markerLength = leadSentMarker.length;
+        var richText = SpreadsheetApp.newRichTextValue()
+          .setText(newCellText)
+          .setTextStyle(0, markerLength, SpreadsheetApp.newTextStyle().setBold(true).build())
+          .build();
+        cell.setRichTextValue(richText);
+        
+        leadsSent++;
+        Logger.log("✅ Лид успешно отправлен в Telegram и Email, помечен в ячейке " + cellAddress);
+      } else if (telegramSuccess || emailSuccess) {
+        // Частичный успех
+        leadsError++;
+        Logger.log("⚠️ Лид частично отправлен (Telegram: " + telegramSuccess + ", Email: " + emailSuccess + ") из ячейки " + cellAddress);
+      } else {
+        // Ошибка при отправке в оба канала
+        leadsError++;
+        Logger.log("❌ Ошибка при отправке лида из ячейки " + cellAddress);
       }
       
-      // Запоминаем следующую позицию
-      PropertiesService.getScriptProperties().setProperty('API_CONTINUE_ROW', row.toString());
-      PropertiesService.getScriptProperties().setProperty('API_CONTINUE_COL', (col + 1).toString());
-      
-      // Обработали одну ячейку, выходим из циклов
-      break outerLoop;
+      // Небольшая пауза перед следующим лидом
+      Utilities.sleep(500);
     }
   }
   
-  // Если нашли и обработали ячейку, продолжаем обработку напрямую
-  if (foundCellToProcess) {
-    if (isApiRunning()) {
-      var nextRow = parseInt(PropertiesService.getScriptProperties().getProperty('API_CONTINUE_ROW') || '2');
-      var nextCol = parseInt(PropertiesService.getScriptProperties().getProperty('API_CONTINUE_COL') || '2');
-      
-      writeLog("Продолжаем обработку следующей ячейки (" + nextRow + "," + nextCol + ")", "INFO");
-      
-      // Вместо создания нового триггера вызываем continueApiProcessingSequential напрямую
-      // Это значительно ускорит выполнение
-      continueApiProcessingSequential();
-    }
-  } else {
-    writeLog("Не найдено ячеек для обработки. Завершаем.", "INFO");
-    // Очищаем сохраненные позиции
-    PropertiesService.getScriptProperties().deleteProperty('API_CONTINUE_ROW');
-    PropertiesService.getScriptProperties().deleteProperty('API_CONTINUE_COL');
-  }
+  // Логируем итоговую статистику
+  Logger.log("=== Итоги сканирования ===");
+  Logger.log("🔍 Найдено лидов: " + leadsFound);
+  Logger.log("✅ Отправлено: " + leadsSent);
+  Logger.log("⏭️ Пропущено (уже отправлены): " + leadsSkipped);
+  Logger.log("❌ Ошибок: " + leadsError);
+  Logger.log("=== Конец сканирования ===");
+}
+
+/**
+ * Создает триггер для автоматического запуска каждую минуту
+ * Вызывается один раз для активации автоматической отправки
+ */
+function createTelegramNotifierTrigger() {
+  // Удаляем существующие триггеры для этой функции
+  removeTelegramNotifierTrigger();
   
-  writeLog("=== Конец processApiMessagesSequential ===", "DEBUG");
-}
-
-/**
- * Продолжение последовательной обработки
- * Оптимизированная версия без использования триггеров для ускорения
- */
-function continueApiProcessingSequential() {
-  if (!isApiRunning()) {
-    writeLog("API неактивен, не продолжаем", "INFO");
-    return;
-  }
+  // Создаем новый триггер
+  ScriptApp.newTrigger("scanAndSendLeadsToTelegram")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
   
-  var props = PropertiesService.getScriptProperties();
-  var row = parseInt(props.getProperty('API_CONTINUE_ROW') || '2');
-  var col = parseInt(props.getProperty('API_CONTINUE_COL') || '2');
-
-  // Без задержки продолжаем обработку следующей ячейки
-  try {
-    // Используем try-catch, чтобы предотвратить ошибки при превышении лимита времени выполнения
-    processApiMessagesSequential(true, row, col);
-  } catch (e) {
-    writeLog("Ошибка при продолжении обработки: " + e.message, "ERROR");
-    
-    // Если произошла ошибка из-за превышения времени выполнения, 
-    // создаем триггер для продолжения через 1 секунду
-    var triggers = ScriptApp.getProjectTriggers();
-    var hasExistingTrigger = false;
-    
-    for (var i = 0; i < triggers.length; i++) {
-      if (triggers[i].getHandlerFunction() === 'continueApiProcessingSequential') {
-        hasExistingTrigger = true;
-        break;
-      }
-    }
-    
-    if (!hasExistingTrigger) {
-      ScriptApp.newTrigger('continueApiProcessingSequential')
-        .timeBased()
-        .after(1000) // 1 секунда
-        .create();
-      writeLog("Создан триггер для возобновления после ошибки", "INFO");
-    }
-  }
+  Logger.log("✅ Триггер для Telegram и Email уведомлений создан (каждую минуту)");
+  SpreadsheetApp.getUi().alert(
+    "Telegram и Email уведомления активированы",
+    "Система будет автоматически сканировать лист 'Диалоги' каждую минуту\n" +
+    "и отправлять новые анализы от ИИ в Telegram группу и на Email.",
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
 }
 
 /**
- * Функция-обёртка для ручного запуска обновления диалогов.
+ * Удаляет триггер автоматической отправки в Telegram и Email
+ * Вызывается для остановки автоматической отправки
  */
-function runUpdate() {
-  updateDialogHistory();
-  createTimeTriggerDialogs();
-}
-
-/**
- * Создаёт триггер для updateDialogHistory каждые 10 минут, если нет.
- */
-function createTimeTriggerDialogs() {
+function removeTelegramNotifierTrigger() {
   var triggers = ScriptApp.getProjectTriggers();
-  var found = triggers.some(function(t) {
-    return t.getHandlerFunction() === "updateDialogHistory";
-  });
-  if (!found) {
-    ScriptApp.newTrigger("updateDialogHistory")
-      .timeBased()
-      .everyMinutes(10)
-      .create();
-    writeLog("Создан триггер для updateDialogHistory (каждые 10 мин)");
-  } else {
-    writeLog("Триггер updateDialogHistory уже существует", "INFO");
-  }
-}
-
-/**
- * Функция выполняется при открытии таблицы. 
- * Автоматически настраивает обработку упоминаний ботов без необходимости ручной активации.
- */
-function onOpen() {
-  var ui = SpreadsheetApp.getUi();
-  try {
-    // Создаем основные меню
-    ui.createMenu('Сборка диалогов')
-      .addItem('📋 Инструкция', 'showInstructions')
-      .addItem('📥 Собрать диалоги (runUpdate)', 'runUpdate')
-      .addItem('🗑️ Очистить логи', 'clearLogs')
-      .addToUi();
-
-    ui.createMenu('API обработчик')
-      .addItem('✅ Включить API обработчик', 'startApiProcessing')
-      .addItem('❌ Выключить API обработчик', 'stopApiProcessing')
-      .addToUi();
-
-    ui.createMenu('Аналитика токенов')
-      .addItem('📊 Обновить аналитику', 'runAnalyticsUpdate')
-      .addItem('📈 Обновить диаграммы', 'runCreateCharts')
-      .addToUi();
-      
-    // Меню для управления Telegram уведомлениями
-    ui.createMenu('📱 Telegram Лиды')
-      .addItem('✅ Включить автоотправку (каждую минуту)', 'createTelegramNotifierTrigger')
-      .addItem('❌ Выключить автоотправку', 'removeTelegramNotifierTrigger')
-      .addSeparator()
-      .addItem('📊 Проверить статус', 'showTelegramNotifierStatus')
-      .addItem('🖱️ Запустить сканирование вручную', 'manualScanForLeads')
-      .addSeparator()
-      .addItem('🧪 Тест подключения к Telegram', 'testTelegramConnection')
-      .addToUi();
-      
-    // Временное меню для настройки Co-Pilot (можно удалить после установки)
-    ui.createMenu('⚙️ Настройка Co-Pilot')
-      .addItem('✅ Установить автоматическую обработку ботов', 'createInstalledTrigger')
-      .addToUi();
-
-    // Основная инициализация
-    basicInitializeApiFields();
-    simpleUpdateApiStatusDisplay();
-    
-    // Автоматическая инициализация Co-Pilot
-    try {
-      // Проверяем/создаем лист настроек
-      var settingsSheet = ensureSettingsSheetExists();
-      Logger.log("Лист настроек Co-Pilot проверен");
-    } catch (e) {
-      Logger.log("Ошибка при автоматической инициализации Co-Pilot: " + e);
-    }
-    
-    Logger.log("Скрипт инициализирован");
-  } catch (error) {
-    Logger.log("Ошибка в onOpen: " + error);
-  }
-}
-
-/**
- * Проверяет наличие или создает лист настроек Co-Pilot.
- * @return {Sheet} Лист с настройками
- */
-function ensureSettingsSheetExists() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var settingsSheet = ss.getSheetByName("Настройки Co-Pilot");
+  var removedCount = 0;
   
-  if (!settingsSheet) {
-    // Создаем новый лист
-    settingsSheet = ss.insertSheet("Настройки Co-Pilot");
-    
-    // Настраиваем заголовки
-    settingsSheet.getRange("A1:B1").setValues([["ID бота", "API токен"]]);
-    settingsSheet.getRange("A1:B1").setFontWeight("bold").setBackground("#4285F4").setFontColor("white");
-    
-    // Пример данных
-    settingsSheet.getRange("A2:B2").setValues([["1234567", "ваш_токен_здесь"]]);
-    
-    // Форматирование
-    settingsSheet.setColumnWidth(1, 150);
-    settingsSheet.setColumnWidth(2, 300);
-    
-    // Добавляем инструкции
-    settingsSheet.getRange("D1:F1").merge();
-    settingsSheet.getRange("D1").setValue("ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ УПОМИНАНИЙ БОТОВ");
-    settingsSheet.getRange("D1").setFontWeight("bold").setBackground("#4285F4").setFontColor("white");
-    
-    var instructions = [
-      ["1. Введите ID бота и токен API из ChatForYou в столбцы A и B"],
-      ["2. В любой ячейке используйте формат: @botId Ваш запрос к боту"],
-      ["3. Бот автоматически обработает все упоминания при изменении таблицы"],
-      ["4. Можно использовать ссылки на ячейки в формате {A1} внутри запроса"],
-      ["5. Используйте ## для разделения нескольких запросов в одной ячейке"]
-    ];
-    settingsSheet.getRange("D2:F6").setValues(instructions);
-    
-    Logger.log("Создан новый лист настроек Co-Pilot");
-  }
-  
-  return settingsSheet;
-}
-
-/**
- * Проверяет, существует ли триггер для обработки упоминаний ботов.
- * @return {boolean} true, если триггер существует
- */
-function checkBotMentionsTriggerStatus() {
-  var triggers = ScriptApp.getProjectTriggers();
   for (var i = 0; i < triggers.length; i++) {
-    var trigger = triggers[i];
-    if (trigger.getHandlerFunction() === "processBotMentions" && 
-        trigger.getEventType() === ScriptApp.EventType.ON_EDIT) {
+    if (triggers[i].getHandlerFunction() === "scanAndSendLeadsToTelegram") {
+      ScriptApp.deleteTrigger(triggers[i]);
+      removedCount++;
+    }
+  }
+  
+  if (removedCount > 0) {
+    Logger.log("🗑️ Удалено триггеров: " + removedCount);
+    SpreadsheetApp.getUi().alert(
+      "Telegram и Email уведомления деактивированы",
+      "Автоматическая отправка лидов остановлена.",
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+  } else {
+    Logger.log("ℹ️ Триггеры не найдены");
+  }
+}
+
+/**
+ * Проверяет статус триггера уведомлений
+ * @return {boolean} true если триггер активен, false если нет
+ */
+function checkTelegramNotifierStatus() {
+  var triggers = ScriptApp.getProjectTriggers();
+  
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "scanAndSendLeadsToTelegram") {
       return true;
     }
   }
+  
   return false;
 }
 
 /**
- * Упрощённая инициализация полей (ID бота, токен).
+ * Показывает текущий статус триггера
  */
-function basicInitializeApiFields() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var dialogSheet = ss.getSheetByName("Диалоги");
-  if (!dialogSheet) {
-    dialogSheet = getDialogSheet();
-  }
-
-  var b1Value = dialogSheet.getRange("B1").getValue();
-  var c1Value = dialogSheet.getRange("C1").getValue();
-  var e1Value = dialogSheet.getRange("E1").getValue();
-  var f1Value = dialogSheet.getRange("F1").getValue();
-
-  if (!b1Value || b1Value === "ID бота") {
-    dialogSheet.getRange("B1").setValue("ID бота")
-      .setFontWeight("bold").setBackground("#e6f2ff");
-  }
-  if (!c1Value || c1Value === "API токен") {
-    dialogSheet.getRange("C1").setValue("API токен")
-      .setFontWeight("bold").setBackground("#e6f2ff");
-  }
-  if (!e1Value) {
-    dialogSheet.getRange("E1").setValue("API обработчик: Остановлен")
-      .setFontWeight("bold").setBackground("#ffe6e6");
-  }
-  if (!f1Value) {
-    dialogSheet.getRange("F1").setValue("Прогресс: 0 из 0 (0%)")
-      .setFontWeight("bold").setBackground("#e6f2ff");
-  }
-  formatDialogSheet();
-  Logger.log("Инициализированы поля API (basic)");
+function showTelegramNotifierStatus() {
+  var isActive = checkTelegramNotifierStatus();
+  var status = isActive ? "✅ АКТИВЕН" : "❌ НЕАКТИВЕН";
+  
+  SpreadsheetApp.getUi().alert(
+    "Статус Telegram и Email уведомлений",
+    "Текущий статус: " + status + "\n\n" +
+    (isActive ? 
+      "Система автоматически сканирует лист каждую минуту." : 
+      "Автоматическая отправка отключена. Используйте меню для активации."),
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
 }
 
 /**
- * Упрощённое обновление статуса API при открытии.
+ * Тестовая функция для проверки отправки в Telegram
+ * Отправляет тестовое сообщение
  */
-function simpleUpdateApiStatusDisplay() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var dialogSheet = ss.getSheetByName("Диалоги");
-  if (!dialogSheet) return;
+function testTelegramConnection() {
+  Logger.log("🧪 Тестирование подключения к Telegram...");
   
-  try {
-    var running = isApiRunning();
-    var statusCell = dialogSheet.getRange("E1");
-    if (running) {
-      statusCell.setValue("API обработчик: Запущен (последовательный)")
-        .setFontWeight("bold")
-        .setBackground("#e6ffe6");
-      
-    } else {
-      statusCell.setValue("API обработчик: Остановлен")
-        .setFontWeight("bold")
-        .setBackground("#ffe6e6");
-    }
-  } catch (error) {
-    Logger.log("Ошибка при обновлении статуса: " + error);
-  }
-}
-
-/**
- * Анализ токенов
- */
-function runAnalyticsUpdate() {
-  var TokenAnalytics = {};
+  var testMessage = 
+    "🧪 ТЕСТОВОЕ СООБЩЕНИЕ\n\n" +
+    "Это тестовое сообщение от Google Sheets скрипта.\n" +
+    "Если вы видите это сообщение, значит подключение к Telegram работает корректно! ✅\n\n" +
+    "Время: " + new Date().toString();
   
-  // Проверяем, загружен ли модуль TokenAnalytics
-  try {
-    // Пытаемся вызвать функцию из модуля TokenAnalytics
-    updateTokenAnalytics();
-    writeLog("Запущено обновление аналитики токенов из модуля TokenAnalytics");
-  } catch (e) {
-    // Если модуль не загружен, показываем сообщение
-    writeLog("Модуль TokenAnalytics не загружен: " + e.message, "WARNING");
+  var success = sendToTelegram(testMessage, "TEST");
+  
+  if (success) {
     SpreadsheetApp.getUi().alert(
-      "Модуль TokenAnalytics",
-      "Модуль аналитики токенов не загружен или недоступен. " +
-      "Пожалуйста, убедитесь, что модуль TokenAnalytics.gs добавлен в проект.",
+      "Тест Telegram успешен! ✅",
+      "Тестовое сообщение успешно отправлено в Telegram группу.\n" +
+      "Проверьте группу с ID: " + TELEGRAM_CHAT_ID,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+  } else {
+    SpreadsheetApp.getUi().alert(
+      "Ошибка теста Telegram ❌",
+      "Не удалось отправить тестовое сообщение в Telegram.\n" +
+      "Проверьте:\n" +
+      "1. Токен бота корректен\n" +
+      "2. Бот добавлен в группу как администратор\n" +
+      "3. ID группы указан верно",
       SpreadsheetApp.getUi().ButtonSet.OK
     );
   }
 }
 
 /**
- * Обновление диаграмм
+ * Тестовая функция для проверки отправки на Email
+ * Отправляет тестовое сообщение
  */
-function runCreateCharts() {
-  try {
-    // Пытаемся вызвать функцию из модуля TokenAnalytics
-    createAnalyticsCharts(false); // false означает ручной режим с диалогами
-    writeLog("Запущено обновление диаграмм из модуля TokenAnalytics");
-  } catch (e) {
-    // Если модуль не загружен, показываем сообщение
-    writeLog("Не удалось обновить диаграммы: " + e.message, "ERROR");
+function testEmailConnection() {
+  Logger.log("🧪 Тестирование отправки на Email...");
+  
+  var testMessage = 
+    "🧪 ТЕСТОВОЕ СООБЩЕНИЕ\n\n" +
+    "Это тестовое сообщение от Google Sheets скрипта.\n" +
+    "Если вы видите это письмо, значит отправка на Email работает корректно! ✅\n\n" +
+    "Время: " + new Date().toString();
+  
+  var success = sendToEmail(testMessage);
+  
+  if (success) {
     SpreadsheetApp.getUi().alert(
-      "Ошибка диаграмм",
-      "Не удалось обновить диаграммы. " +
-      "Пожалуйста, убедитесь, что модуль TokenAnalytics.gs добавлен в проект.\n\n" +
-      "Ошибка: " + e.message,
+      "Тест Email успешен! ✅",
+      "Тестовое письмо успешно отправлено на адрес:\n" + EMAIL_ADDRESS + "\n\n" +
+      "Проверьте почту (возможно в папке Спам).",
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+  } else {
+    SpreadsheetApp.getUi().alert(
+      "Ошибка теста Email ❌",
+      "Не удалось отправить тестовое письмо.\n" +
+      "Проверьте логи выполнения для подробностей.",
       SpreadsheetApp.getUi().ButtonSet.OK
     );
   }
 }
 
-function showInstructions() {
-  var ui = SpreadsheetApp.getUi();
-  var msg = 
-    "ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ СКРИПТА:\n\n" +
-    "1. Заполните поля в листе 'Диалоги':\n" +
-    "   • B1 — ID бота в системе ChatForYou\n" +
-    "   • C1 — API токен для доступа к ChatForYou\n\n" +
-    "2. Для обработки диалогов:\n" +
-    "   • Используйте 'Собрать диалоги' для объединения сообщений из Лист1\n" +
-    "   • Диалоги группируются по ChatID и датам\n" +
-    "   • ChatID теперь отображается в формате: 418838097 (@username)\n\n" +
-    "3. Для обработки через API ChatForYou:\n" +
-    "   • Включите API обработчик через меню\n" +
-    "   • Система последовательно обрабатывает ячейки\n" +
-    "   • ChatID из колонки A автоматически добавляется в начало каждого запроса к ИИ\n" +
-    "   • Цвета ячеек: жёлтый - в процессе, зелёный - успешно, красный - ошибка\n\n" +
-    "4. Отправка лидов в Telegram:\n" +
-    "   • Меню '📱 Telegram Лиды' → 'Включить автоотправку'\n" +
-    "   • Система каждую минуту сканирует лист 'Диалоги'\n" +
-    "   • Находит ячейки с '🤖 АНАЛИЗ ОТ ИИ' и отправляет в Telegram\n" +
-    "   • После отправки добавляется метка '✅ ЛИД ОТПРАВЛЕН'\n\n" +
-    "5. Для работы аналитики токенов:\n" +
-    "   • Убедитесь, что файл TokenAnalytics.gs добавлен в проект\n" +
-    "   • Используйте меню 'Аналитика токенов' для обновления данных и диаграмм\n\n" +
-    "6. Дополнительная функция - упоминания ботов:\n" +
-    "   • В системе активирована функция упоминания ботов ChatForYou\n" +
-    "   • Настройте ботов на автоматически созданном листе 'Настройки Co-Pilot'\n" +
-    "   • В любой ячейке используйте формат @botId Ваш запрос\n" +
-    "   • Обработка происходит автоматически при изменении таблицы";
+/**
+ * Комплексный тест отправки в Telegram и Email
+ */
+function testBothConnections() {
+  Logger.log("🧪 Комплексное тестирование Telegram и Email...");
   
-  ui.alert("Инструкция по использованию", msg, ui.ButtonSet.OK);
+  var testMessage = 
+    "🧪 КОМПЛЕКСНОЕ ТЕСТОВОЕ СООБЩЕНИЕ\n\n" +
+    "Это тестовое сообщение от Google Sheets скрипта.\n" +
+    "Оно отправляется одновременно в Telegram и на Email.\n\n" +
+    "Время: " + new Date().toString();
+  
+  var telegramSuccess = sendToTelegram(testMessage, "TEST");
+  Utilities.sleep(500);
+  var emailSuccess = sendToEmail(testMessage);
+  
+  var resultMessage = "Результаты теста:\n\n";
+  resultMessage += "Telegram: " + (telegramSuccess ? "✅ Успешно" : "❌ Ошибка") + "\n";
+  resultMessage += "Email: " + (emailSuccess ? "✅ Успешно" : "❌ Ошибка");
+  
+  if (telegramSuccess && emailSuccess) {
+    resultMessage += "\n\n🎉 Оба канала работают отлично!";
+  } else if (telegramSuccess || emailSuccess) {
+    resultMessage += "\n\n⚠️ Один из каналов имеет проблемы. Проверьте настройки.";
+  } else {
+    resultMessage += "\n\n❌ Оба канала не работают. Проверьте конфигурацию.";
+  }
+  
+  SpreadsheetApp.getUi().alert(
+    "Результаты комплексного теста",
+    resultMessage,
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+/**
+ * Ручной запуск сканирования (для тестирования)
+ */
+function manualScanForLeads() {
+  Logger.log("🖱️ Ручной запуск сканирования...");
+  scanAndSendLeadsToTelegram();
+  SpreadsheetApp.getUi().alert(
+    "Сканирование завершено",
+    "Проверьте логи выполнения (Ctrl+Enter или Просмотр > Логи) для подробной информации.",
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
 }
 
 /******************************************************
- * Конец main.gs
+ * Конец TelegramLeadNotifier.gs
  ******************************************************/
