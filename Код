@@ -1,747 +1,291 @@
-// ============================================
-// ⚙️ НАСТРОЙКИ ОФОРМЛЕНИЯ
-// ============================================
+/******************************************************
+ * TelegramLeadNotifier.gs
+ * Автоматическая отправка анализов от ИИ в Telegram
+ * ВАЖНО: Функция onOpen() удалена для избежания конфликтов с main.gs
+ * Меню добавляется через main.gs
+ ******************************************************/
 
-const SETTINGS = {
-  ROW_HEIGHT: 120,      // Высота карточек
-  COLUMN_WIDTH: 350,    // Ширина колонок с диалогами
-  PHONE_COLUMN_WIDTH: 150  // Ширина колонки с телефонами
-};
+/**
+ * КОНСТАНТЫ ДЛЯ TELEGRAM BOT
+ */
+var TELEGRAM_BOT_TOKEN = "8372070218:AAEZrSDVJ4kqUm5QYIRtPp8b7qTGB7Mt_7Y";
+var TELEGRAM_CHAT_ID = "-4109810158";
 
-// ============================================
-// 🎯 ГЛАВНАЯ ФУНКЦИЯ СБОРА ДИАЛОГОВ
-// ============================================
-
-function собратьДиалоги() {
+/**
+ * Отправляет сообщение в Telegram через Bot API
+ * @param {string} message - текст сообщения для отправки
+ * @return {boolean} true если успешно, false если ошибка
+ */
+function sendToTelegram(message) {
+  // КРИТИЧЕСКАЯ ПРОВЕРКА: сообщение не должно быть пустым
+  if (!message || message.toString().trim() === "") {
+    Logger.log("❌ ОШИБКА: Попытка отправить пустое сообщение в Telegram!");
+    return false;
+  }
+  
+  Logger.log("📤 Отправка сообщения в Telegram, длина: " + message.length + " символов");
+  
+  var url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage";
+  
+  var payload = {
+    chat_id: TELEGRAM_CHAT_ID,
+    text: message.toString().trim(),
+    parse_mode: "HTML"
+  };
+  
+  var options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const sourceSheet = ss.getSheets()[0]; // Первый лист с логами
+    var response = UrlFetchApp.fetch(url, options);
+    var responseCode = response.getResponseCode();
+    var responseText = response.getContentText();
     
-    Logger.log('Начало обработки логов...');
-    
-    // Получаем данные
-    const lastRow = sourceSheet.getLastRow();
-    if (lastRow < 2) {
-      Logger.log('Нет данных для обработки');
-      return;
-    }
-    
-    // Определяем количество колонок
-    const lastCol = sourceSheet.getLastColumn();
-    Logger.log('Колонок в таблице: ' + lastCol);
-    
-    // Добавляем заголовок для колонки G если его нет
-    if (lastCol < 7) {
-      sourceSheet.getRange(1, 7).setValue('Статус');
-      sourceSheet.getRange(1, 7).setFontWeight('bold');
-    }
-    
-    // Читаем данные
-    const colsToRead = Math.max(6, lastCol);
-    const dataRange = sourceSheet.getRange(2, 1, lastRow - 1, Math.min(colsToRead, 7));
-    const data = dataRange.getValues();
-    
-    // Группируем диалоги по ID разговора
-    const conversations = {};
-    const rowsToMark = [];
-    
-    for (let i = 0; i < data.length; i++) {
-      const row = data[i];
-      const rowNum = i + 2;
-      
-      const timestamp = row[0]; // A
-      const userPhrase = row[1]; // B
-      const botPhrase = row[2]; // C
-      const conversationId = row[4]; // E
-      const phoneData = row[5]; // F
-      const status = row.length >= 7 ? row[6] : ''; // G
-      
-      // Пропускаем обработанные строки
-      if (status === 'обработано' || status === 'processed') {
-        continue;
-      }
-      
-      // Пропускаем строки без ID или телефона
-      if (!conversationId || !phoneData || conversationId.toString().trim() === '' || phoneData.toString().trim() === '') {
-        continue;
-      }
-      
-      const convId = conversationId.toString().trim();
-      
-      // Инициализируем объект для нового разговора
-      if (!conversations[convId]) {
-        const phoneStr = phoneData.toString();
-        let callType = 'unknown';
-        let phoneNumber = '';
-        
-        if (phoneStr.includes('INBOUND:')) {
-          callType = 'incoming';
-          phoneNumber = phoneStr.replace('INBOUND:', '').trim();
-        } else if (phoneStr.includes('OUTBOUND:')) {
-          callType = 'outgoing';
-          phoneNumber = phoneStr.replace('OUTBOUND:', '').trim();
-        } else {
-          phoneNumber = phoneStr.trim();
-          callType = 'incoming';
-        }
-        
-        phoneNumber = phoneNumber.replace('+', '');
-        
-        if (phoneNumber === '') continue;
-        
-        conversations[convId] = {
-          date: timestamp,
-          phone: phoneNumber,
-          type: callType,
-          messages: [],
-          rows: []
-        };
-      }
-      
-      // Добавляем сообщения
-      if (userPhrase && userPhrase.toString().trim() !== '') {
-        conversations[convId].messages.push({
-          type: 'client',
-          text: userPhrase.toString().trim()
-        });
-      }
-      
-      if (botPhrase && botPhrase.toString().trim() !== '') {
-        conversations[convId].messages.push({
-          type: 'bot',
-          text: botPhrase.toString().trim()
-        });
-      }
-      
-      conversations[convId].rows.push(rowNum);
-    }
-    
-    // Обрабатываем собранные диалоги
-    let processedCount = 0;
-    
-    for (let convId in conversations) {
-      const conv = conversations[convId];
-      
-      if (conv.messages.length === 0) continue;
-      if (conv.type === 'unknown') continue;
-      
-      // Определяем целевой лист
-      const targetSheetName = conv.type === 'incoming' ? 'Входящие' : 'Исходящие';
-      let targetSheet = ss.getSheetByName(targetSheetName);
-      
-      if (!targetSheet) {
-        targetSheet = createAndFormatCRMSheet(ss, targetSheetName);
-      }
-      
-      // Обрабатываем диалог
-      processDialogToSheet(targetSheet, conv);
-      
-      // Помечаем обработанные строки
-      rowsToMark.push(...conv.rows);
-      processedCount++;
-    }
-    
-    // Помечаем обработанные строки
-    if (rowsToMark.length > 0) {
-      for (let rowNum of rowsToMark) {
-        sourceSheet.getRange(rowNum, 7).setValue('обработано');
-        sourceSheet.getRange(rowNum, 7).setBackground('#9e9e9e'); // Серый цвет
-      }
-      
-      Logger.log(`Обработано диалогов: ${processedCount}`);
+    if (responseCode === 200) {
+      Logger.log("✅ Сообщение успешно отправлено в Telegram");
+      return true;
     } else {
-      Logger.log('Нет новых диалогов для обработки');
+      Logger.log("❌ Ошибка Telegram API: " + responseCode + " - " + responseText);
+      return false;
     }
-    
   } catch (error) {
-    Logger.log('ОШИБКА: ' + error.toString());
-    Logger.log('Стек ошибки: ' + error.stack);
+    Logger.log("❌ Исключение при отправке в Telegram: " + error.message);
+    return false;
   }
 }
 
-// ============================================
-// 📝 ОБРАБОТКА ДИАЛОГА И ЗАПИСЬ В ЛИСТ
-// ============================================
-
-function processDialogToSheet(sheet, conversation) {
-  const phone = conversation.phone;
-  const dialogDate = conversation.date;
-  const messages = conversation.messages;
+/**
+ * Основная функция сканирования и отправки лидов в Telegram
+ * Проверяет все ячейки листа "Диалоги" начиная с B2
+ * Ищет ячейки с маркером "🤖 АНАЛИЗ ОТ ИИ" без отметки "ЛИД ОТПРАВЛЕН"
+ */
+function scanAndSendLeadsToTelegram() {
+  Logger.log("=== Начало сканирования лидов для Telegram ===");
   
-  // Создаём ПОЛНЫЙ диалог
-  const fullDialogText = createFullDialogWithIndicator(dialogDate, messages);
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var dialogSheet = ss.getSheetByName("Диалоги");
   
-  // Ищем номер в колонке A (начиная со строки 2)
-  const lastRow = sheet.getLastRow();
-  let phoneRow = -1;
-  
-  // Сканируем с первой свободной строки после шапки
-  if (lastRow >= 2) {
-    const phoneColumn = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
-    for (let i = 0; i < phoneColumn.length; i++) {
-      if (phoneColumn[i][0].toString() === phone) {
-        phoneRow = i + 2;
-        break;
-      }
-    }
+  if (!dialogSheet) {
+    Logger.log("❌ Лист 'Диалоги' не найден!");
+    return;
   }
   
-  if (phoneRow === -1) {
-    // Номер не найден - создаём новую строку (начинаем со строки 2)
-    const newRow = Math.max(2, lastRow + 1);
-    
-    // Записываем номер
-    sheet.getRange(newRow, 1).setValue(phone);
-    
-    // Записываем ПОЛНЫЙ диалог в колонку B
-    sheet.getRange(newRow, 2).setRichTextValue(fullDialogText);
-    sheet.getRange(newRow, 2).setWrap(true).setVerticalAlignment('top');
-    
-    // Создаём заголовок для колонки B если это первая запись
-    updateColumnHeaders(sheet, 2);
-    
-    // Применяем форматирование строки (карточный стиль + 180px + СЕРАЯ рамка)
-    formatCRMRow(sheet, newRow);
-    
-  } else {
-    // Номер найден - читаем существующие диалоги и сортируем
-    const existingDialogs = [];
-    
-    const maxCols = Math.min(50, sheet.getMaxColumns() - 1);
-    const rowData = sheet.getRange(phoneRow, 2, 1, maxCols).getRichTextValues()[0];
-    
-    for (let col = 0; col < rowData.length; col++) {
-      const cellValue = rowData[col];
-      if (cellValue && cellValue.getText().trim() !== '') {
-        const cellText = cellValue.getText();
-        const dateMatch = extractDateFromDialog(cellText);
+  var lastRow = dialogSheet.getLastRow();
+  var lastCol = dialogSheet.getLastColumn();
+  
+  Logger.log("📊 Размеры листа: " + lastRow + " строк, " + lastCol + " колонок");
+  
+  // Счетчики для статистики
+  var leadsFound = 0;
+  var leadsSent = 0;
+  var leadsSkipped = 0;
+  var leadsError = 0;
+  
+  // Сканируем все ячейки начиная с B2 (колонка 2, строка 2)
+  for (var row = 2; row <= lastRow; row++) {
+    for (var col = 2; col <= lastCol; col++) {
+      var cell = dialogSheet.getRange(row, col);
+      var cellValue = cell.getValue();
+      
+      // Пропускаем пустые ячейки
+      if (!cellValue || cellValue.toString().trim() === "") {
+        continue;
+      }
+      
+      var cellText = cellValue.toString();
+      
+      // Проверяем наличие маркера "🤖 АНАЛИЗ ОТ ИИ"
+      if (cellText.indexOf("🤖 АНАЛИЗ ОТ ИИ") === -1) {
+        continue;
+      }
+      
+      // Проверяем, не отправлен ли уже лид
+      if (cellText.indexOf("ЛИД ОТПРАВЛЕН") !== -1) {
+        leadsSkipped++;
+        continue;
+      }
+      
+      // Найден лид для отправки!
+      leadsFound++;
+      Logger.log("🎯 Найден лид в ячейке (" + row + ", " + col + ")");
+      
+      // Отправляем в Telegram
+      var sendSuccess = sendToTelegram(cellText);
+      
+      if (sendSuccess) {
+        // Успешно отправлено - добавляем маркер в начало
+        var leadSentMarker = "✅ ЛИД ОТПРАВЛЕН\n\n";
+        var newCellText = leadSentMarker + cellText;
         
-        existingDialogs.push({
-          date: dateMatch,
-          richText: cellValue,
-          column: col + 2
-        });
-      }
-    }
-    
-    // Проверяем, есть ли диалог с той же датой
-    const sameDate = dialogDate instanceof Date ? dialogDate : new Date(dialogDate);
-    let mergeIndex = -1;
-    
-    for (let i = 0; i < existingDialogs.length; i++) {
-      const existDate = existingDialogs[i].date;
-      if (datesAreEqual(existDate, sameDate)) {
-        mergeIndex = i;
-        break;
-      }
-    }
-    
-    if (mergeIndex !== -1) {
-      // Объединяем с существующим диалогом
-      const mergedText = mergeDialogs(existingDialogs[mergeIndex].richText, fullDialogText);
-      sheet.getRange(phoneRow, existingDialogs[mergeIndex].column).setRichTextValue(mergedText);
-      
-    } else {
-      // Добавляем новый диалог и сортируем
-      existingDialogs.push({
-        date: sameDate,
-        richText: fullDialogText,
-        column: -1
-      });
-      
-      // Сортируем по дате
-      existingDialogs.sort((a, b) => {
-        const dateA = a.date instanceof Date ? a.date : new Date(a.date);
-        const dateB = b.date instanceof Date ? b.date : new Date(b.date);
-        return dateA - dateB;
-      });
-      
-      // Очищаем старые данные
-      if (existingDialogs.length > 0) {
-        sheet.getRange(phoneRow, 2, 1, existingDialogs.length).clearContent();
-      }
-      
-      // Записываем отсортированные диалоги
-      for (let i = 0; i < existingDialogs.length; i++) {
-        const col = i + 2;
-        sheet.getRange(phoneRow, col).setRichTextValue(existingDialogs[i].richText);
-        sheet.getRange(phoneRow, col).setWrap(true).setVerticalAlignment('top');
+        // Обновляем ячейку
+        cell.setValue(newCellText);
         
-        // Обновляем заголовок колонки
-        updateColumnHeaders(sheet, col);
+        // Делаем текст маркера жирным
+        // Находим длину маркера для форматирования
+        var markerLength = leadSentMarker.length;
+        var richText = SpreadsheetApp.newRichTextValue()
+          .setText(newCellText)
+          .setTextStyle(0, markerLength, SpreadsheetApp.newTextStyle().setBold(true).build())
+          .build();
+        cell.setRichTextValue(richText);
+        
+        leadsSent++;
+        Logger.log("✅ Лид успешно отправлен и помечен в ячейке (" + row + ", " + col + ")");
+      } else {
+        // Ошибка при отправке
+        leadsError++;
+        Logger.log("❌ Ошибка при отправке лида из ячейки (" + row + ", " + col + ")");
       }
-    }
-  }
-}
-
-// ============================================
-// 💬 СОЗДАНИЕ ПОЛНОГО ДИАЛОГА
-// ✅ ПОКАЗЫВАЕМ ВСЕ СООБЩЕНИЯ ВСЕГДА
-// ============================================
-
-function createFullDialogWithIndicator(date, messages) {
-  const formattedDate = Utilities.formatDate(
-    date instanceof Date ? date : new Date(date), 
-    Session.getScriptTimeZone(), 
-    'dd.MM.yyyy'
-  );
-  
-  const formattedTime = Utilities.formatDate(
-    date instanceof Date ? date : new Date(date), 
-    Session.getScriptTimeZone(), 
-    'HH:mm'
-  );
-  
-  // Создаём текст - начинаем с шапки
-  let dialogText = `📅 ${formattedDate} | 🕐 ${formattedTime}\n\n`;
-  
-  // Добавляем все сообщения
-  for (let msg of messages) {
-    dialogText += форматироватьСообщение(msg);
-  }
-  
-  // Создаём RichText с форматированием
-  const richTextBuilder = SpreadsheetApp.newRichTextValue().setText(dialogText);
-  
-  const lines = dialogText.split('\n');
-  let currentPos = 0;
-  
-  for (let line of lines) {
-    if (line.startsWith('📅')) {
-      // Шапка - жирный синий
-      richTextBuilder.setTextStyle(currentPos, currentPos + line.length,
-        SpreadsheetApp.newTextStyle()
-          .setBold(true)
-          .setForegroundColor('#1a73e8')
-          .setFontSize(10)
-          .build()
-      );
-    } else if (line.startsWith('👤 Клиент:')) {
-      // Клиент - красный жирный для метки
-      richTextBuilder.setTextStyle(currentPos, currentPos + 10,
-        SpreadsheetApp.newTextStyle()
-          .setBold(true)
-          .setForegroundColor('#ea4335')
-          .setFontSize(10)
-          .build()
-      );
-      richTextBuilder.setTextStyle(currentPos + 10, currentPos + line.length,
-        SpreadsheetApp.newTextStyle()
-          .setBold(false)
-          .setForegroundColor('#444444')
-          .setFontSize(10)
-          .build()
-      );
-    } else if (line.startsWith('🤖 Бот:')) {
-      // Бот - зеленый жирный для метки
-      richTextBuilder.setTextStyle(currentPos, currentPos + 7,
-        SpreadsheetApp.newTextStyle()
-          .setBold(true)
-          .setForegroundColor('#34a853')
-          .setFontSize(10)
-          .build()
-      );
-      richTextBuilder.setTextStyle(currentPos + 7, currentPos + line.length,
-        SpreadsheetApp.newTextStyle()
-          .setBold(false)
-          .setForegroundColor('#555555')
-          .setFontSize(10)
-          .build()
-      );
-    }
-    currentPos += line.length + 1;
-  }
-  
-  return richTextBuilder.build();
-}
-
-// ============================================
-// 📝 ФОРМАТИРОВАНИЕ ОДНОГО СООБЩЕНИЯ
-// ============================================
-
-function форматироватьСообщение(msg) {
-  if (msg.type === 'client') {
-    return `👤 Клиент: ${msg.text}\n\n`;
-  } else if (msg.type === 'bot') {
-    return `🤖 Бот: ${msg.text}\n\n`;
-  }
-  return '';
-}
-
-// ============================================
-// 🔧 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ДИАЛОГОВ
-// ============================================
-
-function updateColumnHeaders(sheet, col) {
-  sheet.getRange(1, col).setValue('💬 История разговоров');
-  
-  sheet.getRange(1, col)
-    .setBackground('#e8eaed')
-    .setFontColor('#000000')
-    .setFontWeight('bold')
-    .setFontSize(11)
-    .setHorizontalAlignment('center')
-    .setVerticalAlignment('middle');
-}
-
-function extractDateFromDialog(text) {
-  const lines = text.split('\n');
-  if (lines.length > 0) {
-    const firstLine = lines[0];
-    const datePattern = /(\d{2})\.(\d{2})\.(\d{4})\s+.*?(\d{2}):(\d{2})/;
-    const match = firstLine.match(datePattern);
-    
-    if (match) {
-      const day = parseInt(match[1]);
-      const month = parseInt(match[2]) - 1;
-      const year = parseInt(match[3]);
-      const hour = parseInt(match[4]);
-      const minute = parseInt(match[5]);
       
-      return new Date(year, month, day, hour, minute);
+      // Небольшая пауза между отправками (0.5 сек)
+      Utilities.sleep(500);
     }
   }
-  return new Date();
+  
+  // Логируем итоговую статистику
+  Logger.log("=== Итоги сканирования ===");
+  Logger.log("🔍 Найдено лидов: " + leadsFound);
+  Logger.log("✅ Отправлено: " + leadsSent);
+  Logger.log("⏭️ Пропущено (уже отправлены): " + leadsSkipped);
+  Logger.log("❌ Ошибок: " + leadsError);
+  Logger.log("=== Конец сканирования ===");
 }
 
-function datesAreEqual(date1, date2) {
-  if (!(date1 instanceof Date) || !(date2 instanceof Date)) return false;
+/**
+ * Создает триггер для автоматического запуска каждую минуту
+ * Вызывается один раз для активации автоматической отправки
+ */
+function createTelegramNotifierTrigger() {
+  // Удаляем существующие триггеры для этой функции
+  removeTelegramNotifierTrigger();
   
-  return date1.getFullYear() === date2.getFullYear() &&
-         date1.getMonth() === date2.getMonth() &&
-         date1.getDate() === date2.getDate() &&
-         date1.getHours() === date2.getHours() &&
-         date1.getMinutes() === date2.getMinutes();
+  // Создаем новый триггер
+  ScriptApp.newTrigger("scanAndSendLeadsToTelegram")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+  
+  Logger.log("✅ Триггер для Telegram уведомлений создан (каждую минуту)");
+  SpreadsheetApp.getUi().alert(
+    "Telegram уведомления активированы",
+    "Система будет автоматически сканировать лист 'Диалоги' каждую минуту\n" +
+    "и отправлять новые анализы от ИИ в Telegram группу.",
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
 }
 
-function mergeDialogs(existingRichText, newRichText) {
-  const existingText = existingRichText.getText();
-  const newText = newRichText.getText();
+/**
+ * Удаляет триггер автоматической отправки в Telegram
+ * Вызывается для остановки автоматической отправки
+ */
+function removeTelegramNotifierTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  var removedCount = 0;
   
-  const mergedText = existingText + '\n\n' + newText;
-  
-  return SpreadsheetApp.newRichTextValue()
-    .setText(mergedText)
-    .build();
-}
-
-// ============================================
-// 🎨 СОЗДАНИЕ И ОФОРМЛЕНИЕ ЛИСТА CRM
-// ============================================
-
-function createAndFormatCRMSheet(ss, sheetName) {
-  const sheet = ss.insertSheet(sheetName);
-  
-  // Расширяем колонки если нужно
-  const currentMaxCols = sheet.getMaxColumns();
-  if (currentMaxCols < 50) {
-    sheet.insertColumnsAfter(currentMaxCols, 50 - currentMaxCols);
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "scanAndSendLeadsToTelegram") {
+      ScriptApp.deleteTrigger(triggers[i]);
+      removedCount++;
+    }
   }
   
-  // Устанавливаем ширину колонок
-  sheet.setColumnWidth(1, SETTINGS.PHONE_COLUMN_WIDTH);
-  const maxColsToFormat = Math.min(50, sheet.getMaxColumns());
-  for (let i = 2; i <= maxColsToFormat; i++) {
-    sheet.setColumnWidth(i, SETTINGS.COLUMN_WIDTH);
-  }
-  
-  // Создаём красивую шапку
-  sheet.getRange('A1').setValue('📞 Телефон');
-  sheet.getRange('B1').setValue('💬 История разговоров');
-  
-  // Форматируем шапку (СВЕТЛО-СЕРЫЙ + ЧЕРНЫЙ ТЕКСТ)
-  sheet.getRange('A1:B1')
-    .setBackground('#e8eaed')  // Светло-серый нативный
-    .setFontColor('#000000')   // Черный текст
-    .setFontWeight('bold')
-    .setFontSize(11)
-    .setHorizontalAlignment('center')
-    .setVerticalAlignment('middle');
-  
-  sheet.setRowHeight(1, 40);
-  
-  // Замораживаем
-  sheet.setFrozenRows(1);
-  sheet.setFrozenColumns(1);
-  
-  Logger.log(`Создан лист: ${sheetName}`);
-  return sheet;
-}
-
-// ============================================
-// 🎨 КАРТОЧНОЕ ФОРМАТИРОВАНИЕ СТРОКИ (180px)
-// ============================================
-
-function formatCRMRow(sheet, rowNum) {
-  // Колонка телефона
-  sheet.getRange(rowNum, 1)
-    .setBackground('#f8f9fa')
-    .setFontWeight('bold')
-    .setFontSize(10)
-    .setHorizontalAlignment('center')
-    .setVerticalAlignment('middle')
-    .setBorder(true, true, true, true, null, null, '#d0d0d0', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
-  
-  // ЕДИНЫЙ ФОН для всех карточек
-  const cardBackground = '#ffffff';
-  
-  // ВСЕ РАМКИ СЕРЫЕ ПО УМОЛЧАНИЮ
-  const defaultBorderColor = '#9e9e9e';
-  
-  const maxCols = Math.min(50, sheet.getMaxColumns());
-  
-  if (maxCols > 1) {
-    sheet.getRange(rowNum, 2, 1, maxCols - 1)
-      .setBackground(cardBackground)
-      .setBorder(
-        true, true, true, true, true, true, 
-        defaultBorderColor, 
-        SpreadsheetApp.BorderStyle.SOLID_THICK  // ЖИРНЫЕ ГРАНИЦЫ для карточек
-      );
-  }
-  
-  // Устанавливаем высоту строки 180px
-  sheet.setRowHeight(rowNum, SETTINGS.ROW_HEIGHT);
-}
-
-// ============================================
-// 🎨 ОБНОВЛЕНИЕ ЦВЕТА РАМКИ ПО СТАТУСУ AI
-// ============================================
-
-function updateCellBorderByStatus(sheet, row, col, aiStatus) {
-  const borderColor = getBorderColorByStatus(aiStatus);
-  
-  sheet.getRange(row, col)
-    .setBorder(
-      true, true, true, true, true, true,
-      borderColor,
-      SpreadsheetApp.BorderStyle.SOLID_THICK
+  if (removedCount > 0) {
+    Logger.log("🗑️ Удалено триггеров Telegram: " + removedCount);
+    SpreadsheetApp.getUi().alert(
+      "Telegram уведомления деактивированы",
+      "Автоматическая отправка лидов в Telegram остановлена.",
+      SpreadsheetApp.getUi().ButtonSet.OK
     );
-  
-  Logger.log(`Рамка обновлена на цвет: ${borderColor} для статуса: ${aiStatus}`);
+  } else {
+    Logger.log("ℹ️ Триггеры Telegram не найдены");
+  }
 }
 
-// ============================================
-// 🎨 ОПРЕДЕЛЕНИЕ ЦВЕТА РАМКИ ПО СТАТУСУ
-// ============================================
-
-function getBorderColorByStatus(status) {
-  const statusLower = status.toLowerCase();
+/**
+ * Проверяет статус триггера Telegram уведомлений
+ * @return {boolean} true если триггер активен, false если нет
+ */
+function checkTelegramNotifierStatus() {
+  var triggers = ScriptApp.getProjectTriggers();
   
-  if (statusLower.includes('готов к сделке')) {
-    return '#34a853'; // 🟢 Зеленый
-  }
-  
-  if (statusLower.includes('требует уточнений')) {
-    return '#fbbc04'; // 🟡 Желтый
-  }
-  
-  if (statusLower.includes('отказ')) {
-    return '#ea4335'; // 🔴 Красный
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "scanAndSendLeadsToTelegram") {
+      return true;
+    }
   }
   
-  if (statusLower.includes('новый лид')) {
-    return '#4285f4'; // 🔵 Синий
-  }
+  return false;
+}
+
+/**
+ * Показывает текущий статус триггера
+ */
+function showTelegramNotifierStatus() {
+  var isActive = checkTelegramNotifierStatus();
+  var status = isActive ? "✅ АКТИВЕН" : "❌ НЕАКТИВЕН";
   
-  return '#9e9e9e'; // Серый (по умолчанию)
+  SpreadsheetApp.getUi().alert(
+    "Статус Telegram уведомлений",
+    "Текущий статус: " + status + "\n\n" +
+    (isActive ? 
+      "Система автоматически сканирует лист каждую минуту." : 
+      "Автоматическая отправка отключена. Используйте меню для активации."),
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
 }
 
-// ============================================
-// 🎨 ОБНОВЛЕНИЕ ОФОРМЛЕНИЯ ВСЕХ ЛИСТОВ
-// ============================================
-
-function обновитьОформление() {
-  try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const sheets = ss.getSheets();
-    
-    for (let sheet of sheets) {
-      const sheetName = sheet.getName();
-      
-      if (sheetName === 'Входящие' || sheetName === 'Исходящие') {
-        const lastRow = sheet.getLastRow();
-        const lastCol = sheet.getLastColumn();
-        
-        // Обновляем шапку (СВЕТЛО-СЕРЫЙ + ЧЕРНЫЙ ТЕКСТ)
-        sheet.getRange(1, 1)
-          .setBackground('#e8eaed')  // Светло-серый нативный
-          .setFontColor('#000000')   // Черный текст
-          .setFontWeight('bold')
-          .setFontSize(11)
-          .setHorizontalAlignment('center')
-          .setVerticalAlignment('middle');
-        
-        // Обновляем заголовки для всех использованных колонок
-        if (lastCol >= 2) {
-          for (let col = 2; col <= lastCol; col++) {
-            sheet.getRange(1, col)
-              .setValue('💬 История разговоров')
-              .setBackground('#e8eaed')  // Светло-серый нативный
-              .setFontColor('#000000')   // Черный текст
-              .setFontWeight('bold')
-              .setFontSize(11)
-              .setHorizontalAlignment('center')
-              .setVerticalAlignment('middle');
-          }
-        }
-        
-        sheet.setRowHeight(1, 40);
-        
-        // Обновляем строки с данными (180px высота)
-        if (lastRow > 1) {
-          for (let row = 2; row <= lastRow; row++) {
-            formatCRMRow(sheet, row);
-          }
-        }
-        
-        // Замораживаем
-        sheet.setFrozenRows(1);
-        sheet.setFrozenColumns(1);
-      }
-    }
-    
-    SpreadsheetApp.getUi().alert('✅ Оформление всех листов обновлено!');
-    
-  } catch (error) {
-    SpreadsheetApp.getUi().alert('❌ Ошибка: ' + error.toString());
+/**
+ * Тестовая функция для проверки отправки в Telegram
+ * Отправляет тестовое сообщение
+ */
+function testTelegramConnection() {
+  Logger.log("🧪 Тестирование подключения к Telegram...");
+  
+  var testMessage = 
+    "🧪 ТЕСТОВОЕ СООБЩЕНИЕ\n\n" +
+    "Это тестовое сообщение от Google Sheets скрипта.\n" +
+    "Если вы видите это сообщение, значит подключение к Telegram работает корректно! ✅\n\n" +
+    "Время: " + new Date().toString();
+  
+  var success = sendToTelegram(testMessage);
+  
+  if (success) {
+    SpreadsheetApp.getUi().alert(
+      "Тест успешен! ✅",
+      "Тестовое сообщение успешно отправлено в Telegram группу.\n" +
+      "Проверьте группу с ID: " + TELEGRAM_CHAT_ID,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+  } else {
+    SpreadsheetApp.getUi().alert(
+      "Ошибка теста ❌",
+      "Не удалось отправить тестовое сообщение в Telegram.\n" +
+      "Проверьте:\n" +
+      "1. Токен бота корректен\n" +
+      "2. Бот добавлен в группу как администратор\n" +
+      "3. ID группы указан верно",
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
   }
 }
 
-// ============================================
-// ⏰ УПРАВЛЕНИЕ ТРИГГЕРАМИ СБОРА
-// ============================================
-
-function установитьАвтосбор() {
-  try {
-    удалитьАвтосбор();
-    
-    ScriptApp.newTrigger('собратьДиалоги')
-      .timeBased()
-      .everyMinutes(5)
-      .create();
-    
-    Logger.log('Автосбор включен (каждые 5 минут)');
-    onOpen(); // Обновляем меню
-    
-  } catch (error) {
-    Logger.log('Ошибка установки автосбора: ' + error.toString());
-  }
+/**
+ * Ручной запуск сканирования (для тестирования)
+ */
+function manualScanForLeads() {
+  Logger.log("🖱️ Ручной запуск сканирования...");
+  scanAndSendLeadsToTelegram();
+  SpreadsheetApp.getUi().alert(
+    "Сканирование завершено",
+    "Проверьте логи выполнения (Ctrl+Enter или Просмотр > Логи) для подробной информации.",
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
 }
 
-function удалитьАвтосбор() {
-  try {
-    const triggers = ScriptApp.getProjectTriggers();
-    let deletedCount = 0;
-    
-    for (let trigger of triggers) {
-      if (trigger.getHandlerFunction() === 'собратьДиалоги') {
-        ScriptApp.deleteTrigger(trigger);
-        deletedCount++;
-      }
-    }
-    
-    if (deletedCount > 0) {
-      Logger.log('Автосбор выключен');
-    }
-    
-    onOpen(); // Обновляем меню
-    
-  } catch (error) {
-    Logger.log('Ошибка удаления автосбора: ' + error.toString());
-  }
-}
-
-function переключитьАвтосбор() {
-  try {
-    const triggers = ScriptApp.getProjectTriggers();
-    let isActive = false;
-    
-    for (let trigger of triggers) {
-      if (trigger.getHandlerFunction() === 'собратьДиалоги') {
-        isActive = true;
-        break;
-      }
-    }
-    
-    if (isActive) {
-      удалитьАвтосбор();
-      SpreadsheetApp.getUi().alert('✅ Автосбор выключен');
-    } else {
-      установитьАвтосбор();
-      SpreadsheetApp.getUi().alert('✅ Автосбор включен!\n\nСкрипт будет выполняться каждые 5 минут.');
-    }
-  } catch (error) {
-    SpreadsheetApp.getUi().alert('❌ Ошибка: ' + error.toString());
-  }
-}
-
-// ============================================
-// 📊 СТАТУС ТРИГГЕРОВ
-// ============================================
-
-function показатьСтатусТриггеров() {
-  try {
-    const triggers = ScriptApp.getProjectTriggers();
-    let collectorActive = false;
-    let analyzerActive = false;
-    
-    for (let trigger of triggers) {
-      if (trigger.getHandlerFunction() === 'собратьДиалоги') {
-        collectorActive = true;
-      }
-      if (trigger.getHandlerFunction() === 'анализироватьДиалоги') {
-        analyzerActive = true;
-      }
-    }
-    
-    let status = '📊 СТАТУС СИСТЕМЫ CRM\n\n';
-    status += collectorActive ? '✅ Автосборка: ВКЛЮЧЕНА (каждые 5 минут)\n' : '❌ Автосборка: ВЫКЛЮЧЕНА\n';
-    status += analyzerActive ? '✅ AI-Анализ: ВКЛЮЧЕН (каждую минуту)\n' : '❌ AI-Анализ: ВЫКЛЮЧЕН\n';
-    
-    SpreadsheetApp.getUi().alert(status);
-    
-  } catch (error) {
-    SpreadsheetApp.getUi().alert('❌ Ошибка: ' + error.toString());
-  }
-}
-
-// ============================================
-// 🔍 ПРОВЕРКА АКТИВНОСТИ ТРИГГЕРА
-// ============================================
-
-function isТриггерActive(functionName) {
-  const triggers = ScriptApp.getProjectTriggers();
-  return triggers.some(trigger => trigger.getHandlerFunction() === functionName);
-}
-
-// ============================================
-// 🎛️ СОЗДАНИЕ МЕНЮ С ДИНАМИЧЕСКИМИ ИНДИКАТОРАМИ
-// ============================================
-
-function onOpen() {
-  try {
-    const ui = SpreadsheetApp.getUi();
-    
-    // Проверяем статусы триггеров
-    const collectorStatus = isТриггерActive('собратьДиалоги') ? '✅' : '❌';
-    const analyzerStatus = isТриггерActive('анализироватьДиалоги') ? '✅' : '❌';
-    
-    ui.createMenu('🎛 Управление CRM')
-        .addItem(`${collectorStatus} Автосборка диалогов (5 мин)`, 'переключитьАвтосбор')
-        .addItem(`${analyzerStatus} AI-Анализ (1 мин)`, 'переключитьАвтоанализ')
-        .addSeparator()
-        .addItem('▶️ Собрать диалоги вручную', 'собратьДиалоги')
-        .addItem('▶️ Анализировать вручную', 'анализироватьДиалоги')
-        .addSeparator()
-        .addItem('🎨 Обновить оформление', 'обновитьОформление')
-        .addItem('🧪 Тест Telegram', 'тестТелеграм')
-        .addItem('🧪 Тест Email', 'тестEmail')
-        .addSeparator()
-        .addItem('📊 Статус системы', 'показатьСтатусТриггеров')
-        .addToUi();
-        
-  } catch (error) {
-    Logger.log('Ошибка создания меню: ' + error.toString());
-  }
-}
+/******************************************************
+ * Конец TelegramLeadNotifier.gs
+ ******************************************************/
